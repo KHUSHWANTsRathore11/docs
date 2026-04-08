@@ -1,0 +1,46 @@
+1. The "Day 0" Reality (1 Minute)
+Slide Idea: A simple flowchart: User → Frontend → Backend → OpenAI API.
+
+The Pitch: "Most AI projects start as a simple wrapper. It’s fast to build, but it’s a 'black box.' We have no control over costs, no visibility into what users are asking, and our secrets (API keys) are scattered across the backend."
+
+2. The "Day 1" Challenges (2 Minutes)
+The Problem: Explain that as you scale, you hit four walls:
+
+Security: APIs are exposed to the public internet; keys are in environment variables.
+
+Cost: You’re paying for the same "summarize this text" call 1,000 times because there's no cache.
+
+Fragmentation: Marketing uses ChatGPT, Devs use Gemini, and the business wants to use Copilot—nothing is unified.
+
+Brittle Logic: The app can't "do" anything; it can only "chat."
+
+3. The Solution: The Agentic Enterprise Architecture (3 Minutes)
+Slide Idea: Show the last diagram I generated for you.
+
+Key Highlights:
+
+The VNET "Moat": Everything is tucked inside a private network. No public endpoints for the database or backend.
+
+The AI Gateway (APIM): This is your control tower. It handles caching (saving money), observability (who is using what?), and security (identity-based access).
+
+Multi-Model Strategy: We aren't locked into OpenAI. We can swap to Gemini or use Apify for web data seamlessly through the same gateway.
+
+4. Justifying the "Agentic" Shift (2 Minutes)
+The Pitch: "We aren't just building a chatbot; we're building an Agentic System."
+
+Why Microsoft Agent Framework? Because it allows the app to use Tools.
+
+If the user asks about a website, the agent calls Apify.
+
+If the user wants a workflow in Copilot Studio, the APIs are already registered and ready.
+
+The Managed Agent Service handles the "memory" so the agent remembers the user across sessions without us writing custom database logic every time.
+
+5. The "Bottom Line" (ROI) (2 Minutes)
+Security: Zero Trust architecture.
+
+Reusability: Build an API once in Azure, and use it in your Custom App and Copilot Studio.
+
+Observability: One dashboard to see the cost of every single token across all models.
+
+Future-Proof: The Agent Framework means we can add "skills" to the AI without rewriting the core architecture.
