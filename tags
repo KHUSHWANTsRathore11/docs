@@ -1,0 +1,9 @@
+Here's the same flow expanded to show how each plant/server source moves through the layers. Three example sources are shown; more plants simply add more lanes.Each source keeps its own separate lane until the silver notebook, where all lanes combine into one table.
+
+**ADLS to bronze.** Every plant/server folder gets its own shortcut, under a schema named after the plant, such as `plant_a.server_1`. Its tags folder is shortcut under Files using the same path. Nothing is copied, and the sources stay isolated, so a schema change at plant B doesn't affect plant A.
+
+**Bronze to silver.** One notebook processes every source. It reads the control table and runs once per row, either in a loop or in parallel with `notebookutils.notebook.runMultiple`. Each run receives that source's settings, such as its shortcut path, timezone, column mapping and last watermark. That's how plants with different timezones or column names are handled without separate code. Each run also stamps `plant_id` and `server_id` onto the data and builds `tag_key` from plant, server and tag name.
+
+**Conform and merge.** The runs produce the same canonical schema, so they can be combined safely. Each run MERGEs on `(tag_key, event_ts_utc)`, and dim_tag uses `tag_key` in the same way. You can also stage all runs first and merge once. Because the key includes plant and server, runs never overwrite each other's rows. Each run updates its own watermark only after it succeeds, so a failure at one plant doesn't block the others or force a reload of the rest.
+
+**Silver.** You get one table for all plants rather than one per plant. Consumers filter by `plant_id` or `server_id` as needed. Adding a new plant or server means adding a shortcut and a control table row, with no new pipelines.
