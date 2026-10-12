@@ -101,29 +101,6 @@ def sql_literal(value) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Dates
-# ---------------------------------------------------------------------------
-
-def single_date_in_data(df: DataFrame, date_column: str = "Date"):
-    """Return the one date present in `df` (ignoring nulls), or None if it has no rows.
-
-    Fails if the rows span several days: replacing every day found would let a stray row from
-    a neighbouring day overwrite that day's data.
-    """
-    dates = [
-        r[0] for r in
-        df.select(date_column).where(F.col(date_column).isNotNull()).distinct().limit(11).collect()
-    ]
-    if len(dates) > 1:
-        shown = ", ".join(sorted(d.isoformat() for d in dates[:10])) + (", ..." if len(dates) > 10 else "")
-        raise ValueError(
-            f"Source rows span several days ({shown}); a run loads exactly one UTC day. "
-            "Narrow p_source_path to a single day's files."
-        )
-    return dates[0] if dates else None
-
-
-# ---------------------------------------------------------------------------
 # Transformations
 # ---------------------------------------------------------------------------
 

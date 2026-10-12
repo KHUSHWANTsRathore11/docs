@@ -93,7 +93,7 @@ Fabric ETL/
 
 * **Purpose**: Scheduled daily run triggered at `X 00:00:00 UTC` to process telemetry from `[X-1 00:00:00 UTC, X 00:00:00 UTC)`.
 * **Source**: `p_source_path`, the full path built by the pipeline from the tumbling window start, e.g. `Files/ilayer_SCADA/{Plant}/{Department}/{Year}/{Month}/{Day}/{TableName}/*.parquet`.
-* **Day loaded**: taken from the data (`Time`); all rows must fall on one UTC day, otherwise the run fails.
+* **Source contract**: one path holds exactly one day, `00:00:00` to `23:59:59.999` UTC.
 * **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
 * **Transformation & Partitioning**:
@@ -227,15 +227,15 @@ The notebooks take full locations instead of building them, so they can be reuse
 
 ### 7.3 Deviations from the section 3 spec
 1. **Notebook 1 OPTIMIZE scope.** Delta only accepts partition columns in `OPTIMIZE ... WHERE`, and `departmentname` is not a partition column, so the spec's predicate fails. The notebook scopes by `plantname` and the loaded `Date` range; `departmentname` is still clustered by the Z-Order.
-2. **Idempotent appends.** Plain `.mode("append")` duplicates rows on any re-run or backfill (section 6.4). Notebooks 1 and 2 append through Delta `replaceWhere`, which atomically replaces only the slice being loaded (`plantname` + `departmentname` + `Date` / date range) and leaves every other slice untouched. The first write creates the table partitioned by `(plantname, Year, Month, Date)`.
-3. **Day from the data.** Notebook 2 takes no date parameter: the day it loads and replaces is the one UTC day its rows fall on, and a source spanning several days fails the run (see 7.4). Notebooks 1 and 2 drop rows with a null `Time`, since they cannot be partitioned, and count them in the exit payload.
+2. **Idempotent onboarding.** Notebook 1 appends through Delta `replaceWhere`, which atomically replaces only the slice being loaded (`plantname` + `departmentname` + loaded date range), so re-running an onboarding does not duplicate history. It also drops rows with a null `Time`, since they cannot be partitioned, and counts them in the exit payload. Notebook 2 is a plain append, as specified (see 7.4).
+3. **Z-Order scope from the data.** Notebook 2 takes no date parameter: it Z-Orders the `(Year, Month, Date)` partitions present in the loaded rows, which is the one day of the source path.
 4. **Metadata staging.** Notebook 3 drops rows with a null business key and de-duplicates on `(plantname, departmentname, <p_id_column>)` before the MERGE, because a MERGE fails when several source rows match one target row. Schema auto-merge is enabled so new snapshot columns flow through `UPDATE SET *` / `INSERT *`. The first run creates the table from the snapshot.
 5. **Schema evolution.** Telemetry writes use `mergeSchema = true`, so a new source column is added to the Silver table rather than failing the load.
 
 ### 7.4 Scheduling & reruns (Notebook 2)
 * The pipeline runs Notebook 2 from a daily **tumbling window**, formats the window start into the day's folder and passes only `p_source_path`.
-* The notebook reads the day from the rows' `Time`. Every row must fall on one UTC day; if they span several (e.g. an intraday chunk carrying rows from after midnight), the run fails and lists them rather than replacing more than one day. A source with no rows ends as `NO_DATA`.
-* A failed window is recovered by re-running it: the run replaces its own `plantname` + `departmentname` + `Date` slice, so reruns never duplicate rows and can be done one by one in any order.
+* The notebook reads the path, derives `Year` / `Month` / `Date` from `Time`, appends partitioned by `(plantname, Year, Month, Date)` and Z-Orders that day's partition. A source with no rows ends as `NO_DATA`.
+* **Reruns.** The append is atomic: a run that fails before or during the write leaves nothing behind and can simply be re-run. A run that fails *after* the append committed (i.e. during `OPTIMIZE`) has already loaded its data; re-running it appends the day a second time. Check the run's error before re-running, or re-run only the `OPTIMIZE`.
 * Keep trigger concurrency at 1 per target table (or per plant). Two writes into the same `(plantname, Year, Month, Date)` partition at once, such as two departments of one plant on the same day, can fail with a Delta concurrent-write conflict. The failed run can simply be re-run.
 
 ### 7.5 Decisions still pending (section 6)

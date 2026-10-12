@@ -56,28 +56,23 @@ assert r["rows_written"] == 3 and r["rows_dropped_null_time"] == 1
 r = run("nb_telemetry_historical", **hist); assert spark.table("silver.TAGLOG").count() == 3, "historical rerun not idempotent"
 print(spark.sql("DESCRIBE DETAIL silver.TAGLOG").select("partitionColumns").collect())
 
-# incremental: Boiler's day folder also holds a row from 10-04
-write(f"{bronze}/ilayer_SCADA/PlantA/Boiler/2026/10/03/TAGLOG/part1.parquet", [(1, T("2026-10-03 00:00:00"), 4.0), (2, T("2026-10-03 23:59:59"), 5.0), (2, T("2026-10-04 00:00:00"), 6.0)], cols)
-# second department, same plant
+# incremental: one day per source path
+write(f"{bronze}/ilayer_SCADA/PlantA/Boiler/2026/10/03/TAGLOG/part1.parquet", [(1, T("2026-10-03 00:00:00"), 4.0), (2, T("2026-10-03 23:59:59"), 5.0)], cols)
 write(f"{bronze}/ilayer_SCADA/PlantA/Turbine/2026/10/03/TAGLOG/part1.parquet", [(7, T("2026-10-03 12:00:00"), 7.0)], cols)
 inc = lambda dept: dict(p_source_path=f"{bronze}/ilayer_SCADA/PlantA/{dept}/2026/10/03/TAGLOG/*.parquet", p_target_table="silver.TAGLOG", p_department=dept)
-# A source spanning two days fails instead of guessing which day to replace
-try:
-    run("nb_telemetry_incremental", **inc("Boiler")); raise SystemExit("multi-day source accepted")
-except ValueError as e: print("rejected:", e)
+r = run("nb_telemetry_incremental", **inc("Boiler"), p_dry_run=True); assert r["status"] == "DRY_RUN", r
 assert spark.table("silver.TAGLOG").count() == 3
-# Single-day source: the day comes from the data; a re-run replaces it
-r = run("nb_telemetry_incremental", **inc("Turbine")); print(r)
-assert r["load_date"] == "2026-10-03" and r["rows_written"] == 1, r
+r = run("nb_telemetry_incremental", **inc("Boiler")); print(r)
+assert r["days"] == ["2026-10-03"] and r["rows_written"] == 2, r
 r = run("nb_telemetry_incremental", **inc("Turbine"))
-assert spark.table("silver.TAGLOG").count() == 4, spark.table("silver.TAGLOG").count()
+assert spark.table("silver.TAGLOG").count() == 6, spark.table("silver.TAGLOG").count()
 spark.table("silver.TAGLOG").orderBy("Time").show()
 
 # reuse in another scenario: different folder layout, columns and target table
-write(f"{bronze}/other_source/events/2026-10-03.parquet", [("A", T("2026-10-03 08:00:00")), ("B", T("2026-10-03 09:00:00")), ("C", None)], ["EventCode", "EventTime"])
+write(f"{bronze}/other_source/events/2026-10-03.parquet", [("A", T("2026-10-03 08:00:00")), ("B", T("2026-10-03 09:00:00"))], ["EventCode", "EventTime"])
 r = run("nb_telemetry_incremental", p_source_path=f"{bronze}/other_source/events/*.parquet", p_target_table="silver.EVENTS",
         p_plant="PlantB", p_department="Packing", p_id_column="EventCode", p_time_column="EventTime")
-assert r["rows_written"] == 2 and r["rows_dropped_null_time"] == 1, r
+assert r["rows_written"] == 2, r
 assert spark.table("silver.EVENTS").count() == 2
 
 # target table validation

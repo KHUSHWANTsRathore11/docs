@@ -12,19 +12,18 @@
 
 # # nb_telemetry_incremental — Daily Incremental (Notebook 2)
 #
-# Loads one UTC day of telemetry and replaces that day's plant/department slice in the target,
-# so a failed run is recovered by simply re-running it. Spec: `CLAUDE.md` section 3.2.
+# Appends one day of telemetry to the target and Z-Orders that day's partition.
+# Spec: `CLAUDE.md` section 3.2.
 #
 # | | |
 # |---|---|
-# | **Source** | `p_source_path`: full path, globs allowed, e.g. `Files/ilayer_SCADA/PlantA/Boiler/2026/10/11/TAGLOG/*.parquet` |
+# | **Source** | `p_source_path`: full path of one day's files, e.g. `Files/ilayer_SCADA/PlantA/Boiler/2026/10/11/TAGLOG/*.parquet` |
 # | **Target** | `p_target_table` partitioned by `(plantname, Year, Month, Date)` |
-# | **Write** | append (a re-run for the same day replaces that plant/department/day slice) |
-# | **Optimize** | `OPTIMIZE ... WHERE plantname/Year/Month/Date ZORDER BY (departmentname, <p_id_column>)` |
+# | **Write** | append |
+# | **Optimize** | `OPTIMIZE ... WHERE plantname/Year/Month/Date ZORDER BY (departmentname, <p_id_column>)` for the loaded day |
 #
-# The caller builds `p_source_path` for the day (e.g. from the tumbling window start). The day
-# loaded is read from the data: all rows must fall on one UTC day, otherwise the run fails and
-# lists the days found.
+# The caller builds `p_source_path` for the day (e.g. from the tumbling window start); the
+# source holds exactly that day, `00:00:00` to `23:59:59.999` UTC.
 #
 # Relative `Files/...` paths resolve against the default lakehouse; `abfss://...` paths work
 # with any lakehouse attached.
@@ -46,8 +45,6 @@ p_dry_run        = False
 # CELL ********************
 
 from datetime import datetime, timezone
-
-from pyspark.sql import functions as F
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 
@@ -72,21 +69,16 @@ require_columns(raw_df, [time_column, id_column], "source")
 
 df = add_time_partitions(add_source_columns(raw_df, plant, department), time_column)
 
-# Rows without an event time cannot be partitioned; drop them and report the count.
-null_time_rows = df.filter(F.col(time_column).isNull()).count()
-df = df.filter(F.col(time_column).isNotNull())
+# Partitions written by this run, for the scoped Z-Order.
+loaded_partitions = df.select("Year", "Month", "Date").distinct().collect()
+row_count = df.count()
 
-# The day to replace comes from the data; fails if the rows span several days.
-load_date = single_date_in_data(df)
-row_count = df.count() if load_date else 0
-
-print(f"Day                 : {load_date}")
-print(f"Rows to load        : {row_count}")
-print(f"Rows dropped (null {time_column}): {null_time_rows}")
+print(f"Rows to load : {row_count}")
+print(f"Days         : {sorted(str(r['Date']) for r in loaded_partitions)}")
 
 # CELL ********************
 
-# Write & optimize
+# Append & optimize
 if row_count == 0:
     status = "NO_DATA"
 elif dry_run:
@@ -94,22 +86,16 @@ elif dry_run:
     df.show(10, truncate=False)
     status = "DRY_RUN"
 else:
-    # Replacing exactly this plant/department/day makes reruns and backfills idempotent;
-    # for every other slice this is an append.
-    replace_predicate = (
-        f"{PLANT_COLUMN} = {sql_literal(plant)}"
-        f" AND {DEPARTMENT_COLUMN} = {sql_literal(department)}"
-        f" AND Date = {sql_literal(load_date)}"
-    )
-    write_partitioned_slice(df, target_table, TELEMETRY_PARTITION_COLUMNS, replace_predicate)
+    write_partitioned_slice(df, target_table, TELEMETRY_PARTITION_COLUMNS)
 
-    optimize_predicate = (
-        f"{PLANT_COLUMN} = {sql_literal(plant)}"
-        f" AND Year = {load_date.year}"
-        f" AND Month = {load_date.month}"
-        f" AND Date = {sql_literal(load_date)}"
-    )
-    zorder_optimize(spark, target_table, optimize_predicate, [DEPARTMENT_COLUMN, id_column])
+    for r in loaded_partitions:
+        optimize_predicate = (
+            f"{PLANT_COLUMN} = {sql_literal(plant)}"
+            f" AND Year = {r['Year']}"
+            f" AND Month = {r['Month']}"
+            f" AND Date = {sql_literal(r['Date'])}"
+        )
+        zorder_optimize(spark, target_table, optimize_predicate, [DEPARTMENT_COLUMN, id_column])
     status = "SUCCEEDED"
 
 # CELL ********************
@@ -121,10 +107,8 @@ notebook_exit({
     "department": department,
     "table": target_table,
     "source_path": source_path,
-    "load_date": load_date,
-    "rows_read": row_count + null_time_rows,
+    "days": sorted(str(r["Date"]) for r in loaded_partitions),
     "rows_written": row_count if status == "SUCCEEDED" else 0,
-    "rows_dropped_null_time": null_time_rows,
     "started_utc": run_started,
     "finished_utc": datetime.now(timezone.utc),
 })
