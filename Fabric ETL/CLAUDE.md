@@ -52,7 +52,7 @@ Fabric ETL/
 │   ├── nb_telemetry_incremental.py  <-- [Notebook 2] Daily scheduled incremental [X-1, X)
 │   └── nb_metadata_sync.py          <-- [Notebook 3] Daily SCD1 metadata/dimension sync
 ├── utils/
-│   └── nb_lib_delta_helpers.py      <-- Shared logic (partition derivation, Z-Order)
+│   └── nb_lib_delta_helpers.py      <-- Shared logic (time columns, clustering, Z-Order, merge)
 └── tests/
     └── smoke_test_local.py          <-- Local PySpark + Delta end-to-end test
 ```
@@ -65,17 +65,12 @@ Fabric ETL/
 * **Source**: `p_source_path`, the full path passed by the caller (globs allowed), e.g. `Files/rlayer_SCADA/{Plant}/{Department}/*/*/*/{TableName}.parquet`
 * **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
-* **Transformation & Partitioning**:
+* **Transformation & Layout**:
   * `PlantName` / `DepartmentName` come from the source files (column names in `p_plant_column` / `p_department_column`).
   * Derives `Year = year(col("Time"))`, `Month = month(col("Time"))`, `Date = to_date(col("Time"))`.
-  * Appends partitioned by `(PlantName, Year, Month, Date)`.
+  * Writes to a table **liquid-clustered** by `(Date, PlantName, DepartmentName, <p_id_column>)`; no partitioning (see 7.6).
 * **Optimization**:
-  * Runs scoped Z-Order:
-    ```sql
-    OPTIMIZE <p_target_table>
-    WHERE PlantName = '<plant>' AND DepartmentName = '<department>'
-    ZORDER BY (DepartmentName, <p_id_column>);
-    ```
+  * Runs `OPTIMIZE <p_target_table>` (incremental clustering on Fabric Runtime 2.0).
 * **Parameters**:
   ```python
   p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet"
@@ -96,20 +91,12 @@ Fabric ETL/
 * **Source contract**: one path holds exactly one day, `00:00:00` to `23:59:59.999` UTC.
 * **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
-* **Transformation & Partitioning**:
+* **Transformation & Layout**:
   * `PlantName` / `DepartmentName` come from the source files (column names in `p_plant_column` / `p_department_column`).
   * Derives `Year`, `Month`, `Date` strictly from column `Time`.
-  * Appends partitioned by `(PlantName, Year, Month, Date)`.
+  * Appends to a table **liquid-clustered** by `(Date, PlantName, DepartmentName, <p_id_column>)`; no partitioning (see 7.6).
 * **Optimization**:
-  * Runs partition-scoped Z-Order for the processed date:
-    ```sql
-    OPTIMIZE <p_target_table>
-    WHERE PlantName = '<plant>' 
-      AND Year = {target_year} 
-      AND Month = {target_month} 
-      AND Date = '{target_date}'
-    ZORDER BY (DepartmentName, <p_id_column>);
-    ```
+  * Runs `OPTIMIZE <p_target_table>`, which clusters only the data written since the last run on Fabric Runtime 2.0. A failed `OPTIMIZE` does not fail the run (see 7.4).
 * **Parameters**:
   ```python
   p_source_path    = "Files/ilayer_SCADA/PlantA/Boiler/2026/10/11/TAGLOG/*.parquet"
@@ -142,6 +129,7 @@ Fabric ETL/
     WHEN NOT MATCHED THEN 
       INSERT *;
     ```
+* **Layout**: no partitioning; after the merge runs `OPTIMIZE <p_target_table> ZORDER BY (PlantName, DepartmentName)`.
 * **Parameters**:
   ```python
   p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
@@ -221,26 +209,50 @@ The notebooks take full locations instead of building them, so they can be reuse
 |---|---|---|
 | `p_source_path` | all | Full source path handed to `spark.read.parquet` as is; globs allowed (`*`, `{a,b}`) |
 | `p_target_table` | all | Target Delta table: `table`, `lakehouse.table` or `lakehouse.schema.table` |
-| `p_plant_column`, `p_department_column` | all | Names of the plant / department columns already in the source (default `PlantName` / `DepartmentName`); plant is the partition column, both are merge keys |
-| `p_id_column` | all | Z-Order column (1, 2) / business key (3) |
+| `p_plant_column`, `p_department_column` | all | Names of the plant / department columns already in the source (default `PlantName` / `DepartmentName`); clustering keys (1, 2), merge and Z-Order keys (3) |
+| `p_id_column` | all | Clustering key (1, 2) / business key (3) |
 | `p_time_column` | 1, 2 | Event timestamp column (UTC), default `Time` |
 
 `p_target_table` and the column names are validated as identifiers (`^[A-Za-z_][A-Za-z0-9_]*$` per part) before anything runs, since they are interpolated into SQL. Plant / department values read from the data are escaped as SQL literals. `p_source_path` is only checked for being non-empty.
 
 ### 7.3 Deviations from the section 3 spec
-1. **Notebook 1 OPTIMIZE scope.** Delta only accepts partition columns in `OPTIMIZE ... WHERE`, and `DepartmentName` is not a partition column, so the spec's predicate fails. The notebook scopes by the loaded plants and `Date` range; the department column is still clustered by the Z-Order.
-2. **Idempotent onboarding.** Notebook 1 appends through Delta `replaceWhere`, which atomically replaces only the slice being loaded (the plant/department combinations found in the data + loaded date range), so re-running an onboarding does not duplicate history. It also drops rows with a null `Time`, since they cannot be partitioned, and counts them in the exit payload. Notebook 2 is a plain append, as specified (see 7.4).
-3. **Z-Order scope from the data.** Notebook 2 takes no date or plant parameter: it Z-Orders the `(plant, Year, Month, Date)` partitions present in the loaded rows, which is the one day of the source path.
+1. **Liquid clustering instead of partitioning + Z-Order** for the telemetry tables (Notebooks 1 and 2); see 7.6 for the measurements behind it. The first write creates the table with `CLUSTER BY`; a run against an existing table with a different layout (e.g. the earlier partitioned one) fails instead of appending to it.
+2. **Idempotent onboarding.** Notebook 1 appends through Delta `replaceWhere`, which atomically replaces only the slice being loaded (the plant/department combinations found in the data + loaded date range), so re-running an onboarding does not duplicate history. It also drops rows with a null `Time`, since they have no `Date`, and counts them in the exit payload. Notebook 2 is a plain append, as specified (see 7.4).
+3. **No date or plant parameters.** Notebook 2 takes the plant, department and day from the data; `OPTIMIZE` needs no scope because liquid clustering only processes unclustered data. `Year` and `Month` are still derived for downstream use but are no longer part of the layout.
 4. **Metadata staging.** Notebook 3 drops rows with a null business key and de-duplicates on `(PlantName, DepartmentName, <p_id_column>)` before the MERGE, because a MERGE fails when several source rows match one target row. Schema auto-merge is enabled so new snapshot columns flow through `UPDATE SET *` / `INSERT *`. The first run creates the table from the snapshot.
 5. **Plant / department from the source.** The source files already carry the plant and department columns, so the notebooks inject nothing; they only take the column names. A source missing either column fails the run.
 6. **Schema evolution.** Telemetry writes use `mergeSchema = true`, so a new source column is added to the Silver table rather than failing the load.
 
 ### 7.4 Scheduling & reruns (Notebook 2)
 * The pipeline runs Notebook 2 from a daily **tumbling window**, formats the window start into the day's folder and passes only `p_source_path`.
-* The notebook reads the path, derives `Year` / `Month` / `Date` from `Time`, appends partitioned by `(PlantName, Year, Month, Date)` and Z-Orders that day's partition. A source with no rows ends as `NO_DATA`.
-* **Reruns.** The append is atomic: a run that fails before or during the write leaves nothing behind and can simply be re-run. A run that fails *after* the append committed (i.e. during `OPTIMIZE`) has already loaded its data; re-running it appends the day a second time. Check the run's error before re-running, or re-run only the `OPTIMIZE`.
-* Keep trigger concurrency at 1 per target table (or per plant). Two writes into the same `(PlantName, Year, Month, Date)` partition at once, such as two departments of one plant on the same day, can fail with a Delta concurrent-write conflict. The failed run can simply be re-run.
+* The notebook reads the path, derives `Year` / `Month` / `Date` from `Time`, appends to the clustered table and runs `OPTIMIZE`. A source with no rows ends as `NO_DATA`.
+* **Reruns.** The append is atomic: a run that fails before or during the write leaves nothing behind and can simply be re-run. Once the append has committed, the run is `SUCCEEDED` even if the following `OPTIMIZE` fails; the error is reported in `optimize_error` in the exit payload and the next run's `OPTIMIZE` clusters the data. So a failed run never has committed data, and re-running a failed window never duplicates it.
+* **Concurrency.** Appends from parallel runs (other plants, departments or days) do not conflict with each other. Two `OPTIMIZE`s on the same table at once can conflict; with the rule above that only shows up as `optimize_error`, not as a failed run.
 
 ### 7.5 Decisions still pending (section 6)
-* `Date` is written as a `DATE` (`yyyy-MM-dd`); changing it touches only `add_time_partitions`.
+* `Date` is written as a `DATE` (`yyyy-MM-dd`); changing it touches only `add_time_columns`.
 * A missing source path fails the run (Spark `PATH_NOT_FOUND`); whether an empty day should be `NO_DATA` instead depends on the Control Layer design.
+
+### 7.6 Telemetry table layout: liquid clustering (decision record)
+**Decision:** telemetry Silver tables use liquid clustering by `(Date, PlantName, DepartmentName, TagId)` with no partitioning, maintained by `OPTIMIZE <table>`. This **requires Fabric Runtime 2.0**: on Runtime 1.3 (Delta 3.2) `OPTIMIZE` on a clustered table rewrites every file of a Z-Cube until it exceeds 100 GB, i.e. the whole table each run; Runtime 2.0 clusters incrementally. Metadata tables (`TAGS`) stay unpartitioned with `ZORDER BY (PlantName, DepartmentName)`.
+
+**Context:** plants differ (department sets differ, the same department name can exist in several plants), `TagId` is an integer index that restarts per plant/department, and one plant/department/day is about 120–160 MB of parquet.
+
+**Measurement** (local Delta 3.2, synthetic data shaped like the above: 3 plants, 8 plant/departments, TagIds reused, 14 days, 4.2 M rows / 43 MB, 2 MB target file size, one append + `OPTIMIZE` per plant/department/day as Notebook 2 does). Compare ratios, not absolute sizes.
+
+| | Partition `(Plant, Year, Month, Date)` + Z-Order `(Dept, TagId)` | Liquid `(Date, Plant, Dept, TagId)`, OPTIMIZE per append | Liquid, weekly OPTIMIZE |
+|---|---|---|---|
+| Data rewritten by OPTIMIZE (14 days) | 84 MB (2× table) | 2,406 MB (57× table, Delta 3.2 full rewrite) | 22 MB |
+| MB read: one tag, one plant/dept, one day | 0.88 | 2.24 | 0.30 |
+| MB read: one tag, one plant/dept, 14 days | 12.3 (14 files) | **2.24 (1 file)** | 4.3 |
+| MB read: TagId 42 in every plant/dept, 7 days | 21.6 | **2.2** | 21.9 |
+| MB read: one plant, one day | **1.0** | 42.4 (whole table) | 1.05 |
+| MB read: everything, one day | **3.1** | 42.4 (whole table) | 3.1 |
+
+**Reading:**
+* Liquid clustering reads 5–10× less for tag-history queries, which grow with retention (a partitioned year-long trend reads ≥ 365 files).
+* At this small scale the fully clustered table spread each day over all files, so day-scoped queries read everything; with production volumes (GBs per day, many more files) day pruning improves, but this was not measurable locally. Each append already holds one plant/department/day, so unclustered new data prunes well by plant, department and date.
+* The Runtime 1.3 rewrite cost is the main drawback, and Runtime 2.0 removes it. At 120–160 MB per plant/department/day, partitioning would not have produced small files, so file size did not decide the choice.
+
+**Query guidance:** always filter `PlantName` + `DepartmentName` + `TagId` together; `TagId` alone matches the same index in every plant/department. A combined tag key (e.g. `PlantName|DepartmentName|TagId`) is recommended for Gold models and joins.
+

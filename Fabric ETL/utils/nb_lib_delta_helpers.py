@@ -89,8 +89,8 @@ def sql_literal(value) -> str:
 # Transformations
 # ---------------------------------------------------------------------------
 
-def add_time_partitions(df: DataFrame, time_column: str = "Time") -> DataFrame:
-    """Derive `Year`, `Month`, `Date` strictly from the event time column.
+def add_time_columns(df: DataFrame, time_column: str = "Time") -> DataFrame:
+    """Derive `Year`, `Month`, `Date` strictly from the event time column (`Date` is a clustering key).
 
     `Date` is a DATE (yyyy-MM-dd). The string-vs-integer-day choice is still an open topic
     (CLAUDE.md section 6.1); changing it only requires changing this function.
@@ -106,9 +106,9 @@ def add_time_partitions(df: DataFrame, time_column: str = "Time") -> DataFrame:
     )
 
 
-def telemetry_partition_columns(plant_column: str):
-    """Silver telemetry tables are partitioned by plant, then Year / Month / Date (CLAUDE.md 3.1 / 3.2)."""
-    return [plant_column, "Year", "Month", "Date"]
+def telemetry_cluster_columns(plant_column: str, dept_column: str, id_column: str):
+    """Silver telemetry tables are liquid-clustered by day, plant, department and tag (CLAUDE.md 7.6)."""
+    return ["Date", plant_column, dept_column, id_column]
 
 
 def require_columns(df: DataFrame, columns, context: str) -> None:
@@ -125,44 +125,61 @@ def table_exists(spark: SparkSession, full_table_name: str) -> bool:
     return spark.catalog.tableExists(full_table_name)
 
 
-def write_partitioned_slice(
-    df: DataFrame,
-    full_table_name: str,
-    partition_columns,
-    replace_predicate: str = None,
-) -> None:
-    """Append `df` to a partitioned Delta table.
+def ensure_clustered_table(spark: SparkSession, df: DataFrame, full_table_name: str, cluster_columns) -> None:
+    """Create the target as a liquid-clustered Delta table from `df`'s schema if it is missing.
+
+    Fails if the table exists with a different layout (e.g. the old partitioned one), since
+    appending to it would silently keep the old layout.
+    """
+    cols = [validate_identifier(c, "cluster_column") for c in cluster_columns]
+    if table_exists(spark, full_table_name):
+        detail = spark.sql(f"DESCRIBE DETAIL {full_table_name}").collect()[0]
+        current = list(detail["clusteringColumns"] or []) if "clusteringColumns" in detail.asDict() else []
+        if [c.lower() for c in current] != [c.lower() for c in cols]:
+            raise ValueError(
+                f"{full_table_name} exists with clustering {current} and partitioning "
+                f"{list(detail['partitionColumns'] or [])}; expected CLUSTER BY {cols}. "
+                "Recreate it (a partitioned table cannot be converted in place), or for an "
+                "unpartitioned table run ALTER TABLE ... CLUSTER BY and OPTIMIZE FULL."
+            )
+        return
+    column_ddl = ", ".join(f"`{f.name}` {f.dataType.simpleString()}" for f in df.schema.fields)
+    spark.sql(
+        f"CREATE TABLE {full_table_name} ({column_ddl}) USING DELTA "
+        f"CLUSTER BY ({', '.join(cols)})"
+    )
+
+
+def write_slice(df: DataFrame, full_table_name: str, replace_predicate: str = None) -> None:
+    """Append `df` to an existing Delta table.
 
     With `replace_predicate`, the write atomically replaces exactly the rows matching the
     predicate (Delta `replaceWhere`) instead of blindly appending. The rest of the table is
     untouched, so it still behaves as an append for every other slice, but a
     re-run of the same slice no longer duplicates rows.
     """
-    spark = df.sparkSession
     writer = df.write.format("delta").option("mergeSchema", "true")
-
-    if not table_exists(spark, full_table_name):
-        writer.mode("append").partitionBy(*partition_columns).saveAsTable(full_table_name)
-        return
-
     if replace_predicate:
         writer.mode("overwrite").option("replaceWhere", replace_predicate).saveAsTable(full_table_name)
     else:
         writer.mode("append").saveAsTable(full_table_name)
 
 
-def zorder_optimize(spark: SparkSession, full_table_name: str, where: str, zorder_columns) -> None:
-    """Run `OPTIMIZE <table> WHERE <where> ZORDER BY (<cols>)`.
+def optimize_table(spark: SparkSession, full_table_name: str) -> None:
+    """`OPTIMIZE <table>`: clusters data written since the last run on its clustering columns.
 
-    Delta only accepts partition columns in the OPTIMIZE WHERE clause.
+    Fabric Runtime 2.0 clusters incrementally; on Runtime 1.3 (Delta 3.2) the same statement
+    rewrites the whole table until a cluster exceeds 100 GB (see CLAUDE.md 7.6).
     """
+    print(f"[nb_lib_delta_helpers] OPTIMIZE {full_table_name}")
+    spark.sql(f"OPTIMIZE {full_table_name}")
+
+
+def zorder_optimize(spark: SparkSession, full_table_name: str, zorder_columns) -> None:
+    """`OPTIMIZE <table> ZORDER BY (<cols>)` for unpartitioned, non-clustered tables."""
     cols = ", ".join(validate_identifier(c, "zorder_column") for c in zorder_columns)
-    sql = f"OPTIMIZE {full_table_name}"
-    if where:
-        sql += f" WHERE {where}"
-    sql += f" ZORDER BY ({cols})"
-    print(f"[nb_lib_delta_helpers] {sql}")
-    spark.sql(sql)
+    print(f"[nb_lib_delta_helpers] OPTIMIZE {full_table_name} ZORDER BY ({cols})")
+    spark.sql(f"OPTIMIZE {full_table_name} ZORDER BY ({cols})")
 
 
 def merge_scd1(

@@ -19,9 +19,10 @@ spark.sql("CREATE DATABASE silver")
 bronze = f"{work}/bronze"
 helpers = open(f"{ROOT}/utils/nb_lib_delta_helpers.py").read()
 
-def run(nb, **params):
+def run(nb, _patch="", **params):
     src = open(f"{ROOT}/notebooks/{nb}.py").read()
-    src = src.replace("# MAGIC %run nb_lib_delta_helpers", helpers)
+    # _patch: code run right after the helpers load, to override a helper in one test
+    src = src.replace("# MAGIC %run nb_lib_delta_helpers", helpers + "\n" + _patch)
     # Overrides go right after the parameters cell, as Fabric's injected parameters cell does.
     head, tail = src.split("# CELL ********************", 1)
     override = "\n".join(f"{k} = {v!r}" for k, v in params.items())
@@ -55,8 +56,8 @@ assert not spark.catalog.tableExists("silver.TAGLOG")
 r = run("nb_telemetry_historical", **hist); print(r)
 assert r["rows_written"] == 3 and r["rows_dropped_null_time"] == 1 and r["plant_departments"] == ["PlantA/Boiler"], r
 r = run("nb_telemetry_historical", **hist); assert spark.table("silver.TAGLOG").count() == 3, "historical rerun not idempotent"
-parts = spark.sql("DESCRIBE DETAIL silver.TAGLOG").select("partitionColumns").collect()[0][0]
-assert parts == ["PlantName", "Year", "Month", "Date"], parts
+layout = spark.sql("DESCRIBE DETAIL silver.TAGLOG").select("partitionColumns", "clusteringColumns").collect()[0]
+assert layout[0] == [] and layout[1] == ["Date", "PlantName", "DepartmentName", "TagId"], layout
 
 # incremental: one day per source path
 write(f"{bronze}/ilayer_SCADA/PlantA/Boiler/2026/10/03/TAGLOG/part1.parquet", [("PlantA", "Boiler", 1, T("2026-10-03 00:00:00"), 4.0), ("PlantA", "Boiler", 2, T("2026-10-03 23:59:59"), 5.0)], cols)
@@ -65,18 +66,31 @@ inc = lambda dept: dict(p_source_path=f"{bronze}/ilayer_SCADA/PlantA/{dept}/2026
 r = run("nb_telemetry_incremental", **inc("Boiler"), p_dry_run=True); assert r["status"] == "DRY_RUN", r
 assert spark.table("silver.TAGLOG").count() == 3
 r = run("nb_telemetry_incremental", **inc("Boiler")); print(r)
-assert r["partitions"] == ["PlantA/2026-10-03"] and r["rows_written"] == 2, r
+assert r["loaded"] == ["PlantA/Boiler/2026-10-03"] and r["rows_written"] == 2 and r["optimize_error"] is None, r
 r = run("nb_telemetry_incremental", **inc("Turbine"))
 assert spark.table("silver.TAGLOG").count() == 6, spark.table("silver.TAGLOG").count()
 assert spark.table("silver.TAGLOG").where("DepartmentName = 'Turbine'").count() == 1
 spark.table("silver.TAGLOG").orderBy("Time").show()
 
+# A failed OPTIMIZE after the append does not fail the run (the data is already committed)
+write(f"{bronze}/ilayer_SCADA/PlantA/Cooling/2026/10/03/TAGLOG/part1.parquet", [("PlantA", "Cooling", 3, T("2026-10-03 06:00:00"), 1.5)], cols)
+r = run("nb_telemetry_incremental", _patch="def optimize_table(spark, t):\n    raise RuntimeError('simulated concurrent OPTIMIZE')",
+        p_source_path=f"{bronze}/ilayer_SCADA/PlantA/Cooling/2026/10/03/TAGLOG/*.parquet", p_target_table="silver.TAGLOG")
+assert r["status"] == "SUCCEEDED" and "simulated" in r["optimize_error"] and r["rows_written"] == 1, r
+assert spark.table("silver.TAGLOG").count() == 7
+
+# An existing table with the old partitioned layout is rejected, not silently appended to
+spark.createDataFrame([("PlantA", 1)], ["PlantName", "Year"]).write.format("delta").partitionBy("PlantName").saveAsTable("silver.OLD")
+try:
+    run("nb_telemetry_incremental", **{**inc("Boiler"), "p_target_table": "silver.OLD"}); raise SystemExit("old layout accepted")
+except ValueError as e: print("rejected:", e)
+
 # reuse in another scenario: different folder layout, column names and target table
 write(f"{bronze}/other_source/events/2026-10-03.parquet", [("SiteB", "Packing", "A", T("2026-10-03 08:00:00")), ("SiteB", "Packing", "B", T("2026-10-03 09:00:00"))], ["Site", "Line", "EventCode", "EventTime"])
 r = run("nb_telemetry_incremental", p_source_path=f"{bronze}/other_source/events/*.parquet", p_target_table="silver.EVENTS",
         p_plant_column="Site", p_department_column="Line", p_id_column="EventCode", p_time_column="EventTime")
-assert r["rows_written"] == 2 and r["partitions"] == ["SiteB/2026-10-03"], r
-assert spark.sql("DESCRIBE DETAIL silver.EVENTS").select("partitionColumns").collect()[0][0] == ["Site", "Year", "Month", "Date"]
+assert r["rows_written"] == 2 and r["loaded"] == ["SiteB/Packing/2026-10-03"], r
+assert spark.sql("DESCRIBE DETAIL silver.EVENTS").select("clusteringColumns").collect()[0][0] == ["Date", "Site", "Line", "EventCode"]
 # a missing plant/department column fails clearly
 try:
     run("nb_telemetry_incremental", p_source_path=f"{bronze}/other_source/events/*.parquet", p_target_table="silver.EVENTS",
@@ -99,6 +113,10 @@ write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", [("PlantA", "Boiler",
 r = run("nb_metadata_sync", **meta); print(r)
 spark.table("silver.TAGS").orderBy("TagId").show()
 rows = {x.TagId: x.Unit for x in spark.table("silver.TAGS").collect()}
+tags_layout = spark.sql("DESCRIBE DETAIL silver.TAGS").select("partitionColumns", "clusteringColumns").collect()[0]
+assert tags_layout[0] == [] and not tags_layout[1], tags_layout
+zo = spark.sql("DESCRIBE HISTORY silver.TAGS").where("operation = 'OPTIMIZE'").select("operationParameters").collect()
+assert zo and "PlantName" in zo[0][0]["zOrderBy"] and "DepartmentName" in zo[0][0]["zOrderBy"], zo
 assert rows == {1: "K", 2: "bar", 3: "m3"}, rows
 for bad in [dict(p_target_table="silver.TAGS; DROP TABLE x"), dict(p_source_path="")]:
     try:

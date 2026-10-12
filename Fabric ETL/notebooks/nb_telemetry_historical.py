@@ -12,15 +12,15 @@
 
 # # nb_telemetry_historical — Historical Onboarding (Notebook 1)
 #
-# One-time bulk load of time-series parquet into a partitioned Delta table, e.g. onboarding a
+# One-time bulk load of time-series parquet into a liquid-clustered Delta table, e.g. onboarding a
 # new `{Plant}/{Department}` from the consolidated history export. Spec: `CLAUDE.md` section 3.1.
 #
 # | | |
 # |---|---|
 # | **Source** | `p_source_path`: full path, globs allowed, e.g. `Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet` |
-# | **Target** | `p_target_table` partitioned by `(<p_plant_column>, Year, Month, Date)` |
+# | **Target** | `p_target_table` liquid-clustered by `(Date, <p_plant_column>, <p_department_column>, <p_id_column>)` |
 # | **Write** | append (re-runs replace only the loaded plant/department/date range) |
-# | **Optimize** | `OPTIMIZE ... ZORDER BY (<p_department_column>, <p_id_column>)` scoped to the loaded partitions |
+# | **Optimize** | `OPTIMIZE <table>` (incremental clustering on Fabric Runtime 2.0) |
 #
 # The notebook builds no paths itself. Relative `Files/...` paths resolve against the default
 # lakehouse; `abfss://...` paths work with any lakehouse attached.
@@ -29,7 +29,7 @@
 
 p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet"
 p_target_table   = "silver.TAGLOG"
-p_plant_column      = "PlantName"        # Plant column in the source (partition column)
+p_plant_column      = "PlantName"        # Plant column in the source
 p_department_column = "DepartmentName"   # Department column in the source
 p_id_column      = "TagId"
 p_time_column    = "Time"       # Event timestamp column (UTC)
@@ -66,10 +66,10 @@ print(f"Dry run: {dry_run}")
 raw_df = spark.read.parquet(source_path)
 require_columns(raw_df, [plant_column, dept_column, time_column, id_column], "source")
 
-df = add_time_partitions(raw_df, time_column)
-partition_columns = telemetry_partition_columns(plant_column)
+df = add_time_columns(raw_df, time_column)
+cluster_columns = telemetry_cluster_columns(plant_column, dept_column, id_column)
 
-# Rows without an event time cannot be partitioned; drop them and report the count.
+# Rows without an event time have no Date; drop them and report the count.
 null_time_rows = df.filter(F.col(time_column).isNull()).count()
 df = df.filter(F.col(time_column).isNotNull())
 
@@ -82,7 +82,6 @@ print(f"Date range          : {min_date} -> {max_date}")
 
 # Plant/department combinations in this load; a re-run replaces exactly these over the date range.
 lanes = [(r[0], r[1]) for r in df.select(plant_column, dept_column).distinct().collect()] if row_count else []
-plants = sorted({p for p, _ in lanes}, key=str)
 print(f"Plant/department    : {lanes}")
 
 # CELL ********************
@@ -102,13 +101,11 @@ else:
         f"({plant_column} <=> {sql_literal(p)} AND {dept_column} <=> {sql_literal(d)})" for p, d in lanes
     )
     replace_predicate = f"({lane_predicate}) AND {date_range}"
-    write_partitioned_slice(df, target_table, partition_columns, replace_predicate)
+    ensure_clustered_table(spark, df, target_table, cluster_columns)
+    write_slice(df, target_table, replace_predicate)
 
-    # OPTIMIZE WHERE only accepts partition columns, so the scope is the plants + loaded date
-    # range; the department column is clustered by the Z-Order instead.
-    plant_predicate = " OR ".join(f"{plant_column} <=> {sql_literal(p)}" for p in plants)
-    optimize_predicate = f"({plant_predicate}) AND {date_range}"
-    zorder_optimize(spark, target_table, optimize_predicate, [dept_column, id_column])
+    # Re-running the onboarding is idempotent, so an OPTIMIZE failure can simply fail the run.
+    optimize_table(spark, target_table)
     status = "SUCCEEDED"
 
 # CELL ********************

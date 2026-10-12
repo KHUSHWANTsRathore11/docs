@@ -20,6 +20,7 @@
 # | **Source** | `p_source_path`: full path, e.g. `Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet` (daily full snapshot) |
 # | **Target** | `p_target_table` |
 # | **Write** | Delta `MERGE` on `(<p_plant_column>, <p_department_column>, <p_id_column>)`: update matched, insert new |
+# | **Optimize** | unpartitioned; `OPTIMIZE <table> ZORDER BY (<p_plant_column>, <p_department_column>)` |
 #
 # Tags that disappear from the snapshot are left as they are (retirement handling is a future
 # evolution, see `CLAUDE.md` section 5.2).
@@ -30,7 +31,7 @@
 
 p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
 p_target_table   = "silver.TAGS"
-p_plant_column      = "PlantName"        # Plant column in the source (partition column)
+p_plant_column      = "PlantName"        # Plant column in the source
 p_department_column = "DepartmentName"   # Department column in the source
 p_id_column      = "TagId"
 p_dry_run        = False
@@ -98,6 +99,10 @@ elif dry_run:
 else:
     merge_metrics = merge_scd1(spark, staged, target_table, key_columns)
     print(f"Merge metrics: {merge_metrics}")
+
+    # Unpartitioned table, Z-Ordered by plant and department (CLAUDE.md 3.3). The MERGE is
+    # idempotent, so an OPTIMIZE failure can simply fail the run.
+    zorder_optimize(spark, target_table, [plant_column, dept_column])
     status = "SUCCEEDED"
 
 staged.unpersist()
