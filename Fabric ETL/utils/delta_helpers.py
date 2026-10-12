@@ -25,7 +25,7 @@
 
 import json
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -104,46 +104,11 @@ def sql_literal(value) -> str:
 # Dates
 # ---------------------------------------------------------------------------
 
-def resolve_execution_date(p_execution_date: str) -> date:
-    """Resolve the data day X-1 that the run loads.
-
-    Accepts:
-    * ""                       -> None: the caller derives the day from the data
-    * "YYYY-MM-DD"             -> that day
-    * a window start timestamp -> its UTC day, e.g. a tumbling window's `windowStartTime`
-      ("2026-10-11T00:00:00Z", "2026-10-11T00:00:00.0000000Z", "2026-10-11 02:00:00+02:00").
-      The timestamp must be midnight UTC: the notebook always loads a whole UTC day, so any
-      other start would silently load a different window than the trigger intended.
-    """
-    value = "" if p_execution_date is None else str(p_execution_date).strip()
-    if value == "":
-        return None
-    if len(value) == 10:
-        return datetime.strptime(value, "%Y-%m-%d").date()
-
-    # Normalise ISO 8601 variants: trailing "Z", and 7-digit .NET fractional seconds.
-    iso = value.replace("Z", "+00:00").replace("z", "+00:00")
-    iso = re.sub(r"(\.\d{6})\d+", r"\1", iso)
-    try:
-        ts = datetime.fromisoformat(iso)
-    except ValueError:
-        raise ValueError(
-            f"p_execution_date={value!r} is neither 'YYYY-MM-DD' nor an ISO 8601 timestamp"
-        ) from None
-    ts = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
-    if (ts.hour, ts.minute, ts.second, ts.microsecond) != (0, 0, 0, 0):
-        raise ValueError(
-            f"p_execution_date={value!r} is {ts.isoformat()} in UTC; window starts must be "
-            "00:00:00 UTC because the notebook loads one whole UTC day"
-        )
-    return ts.date()
-
-
 def single_date_in_data(df: DataFrame, date_column: str = "Date"):
     """Return the one date present in `df` (ignoring nulls), or None if it has no rows.
 
     Fails if the rows span several days: replacing every day found would let a stray row from
-    a neighbouring day overwrite that day's data, so the caller must name the day instead.
+    a neighbouring day overwrite that day's data.
     """
     dates = [
         r[0] for r in
@@ -152,16 +117,10 @@ def single_date_in_data(df: DataFrame, date_column: str = "Date"):
     if len(dates) > 1:
         shown = ", ".join(sorted(d.isoformat() for d in dates[:10])) + (", ..." if len(dates) > 10 else "")
         raise ValueError(
-            f"Source rows span several days ({shown}). Pass p_execution_date to choose the day "
-            "to load; rows outside it are dropped."
+            f"Source rows span several days ({shown}); a run loads exactly one UTC day. "
+            "Narrow p_source_path to a single day's files."
         )
     return dates[0] if dates else None
-
-
-def utc_day_window(day: date):
-    """Half-open window [day 00:00:00 UTC, day+1 00:00:00 UTC)."""
-    start = datetime(day.year, day.month, day.day)
-    return start, start + timedelta(days=1)
 
 
 # ---------------------------------------------------------------------------

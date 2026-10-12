@@ -56,45 +56,33 @@ assert r["rows_written"] == 3 and r["rows_dropped_null_time"] == 1
 r = run("nb_telemetry_historical", **hist); assert spark.table("silver.TAGLOG").count() == 3, "historical rerun not idempotent"
 print(spark.sql("DESCRIBE DETAIL silver.TAGLOG").select("partitionColumns").collect())
 
-# incremental day 2026-10-03, with spillover row from 10-04
+# incremental: Boiler's day folder also holds a row from 10-04
 write(f"{bronze}/ilayer_SCADA/PlantA/Boiler/2026/10/03/TAGLOG/part1.parquet", [(1, T("2026-10-03 00:00:00"), 4.0), (2, T("2026-10-03 23:59:59"), 5.0), (2, T("2026-10-04 00:00:00"), 6.0)], cols)
 # second department, same plant
 write(f"{bronze}/ilayer_SCADA/PlantA/Turbine/2026/10/03/TAGLOG/part1.parquet", [(7, T("2026-10-03 12:00:00"), 7.0)], cols)
 inc = lambda dept: dict(p_source_path=f"{bronze}/ilayer_SCADA/PlantA/{dept}/2026/10/03/TAGLOG/*.parquet", p_target_table="silver.TAGLOG", p_department=dept)
-r = run("nb_telemetry_incremental", **inc("Boiler"), p_execution_date="2026-10-03"); print(r)
-assert r["rows_written"] == 2 and r["rows_dropped_out_of_window"] == 1
-# Re-run of the same window, passed as a tumbling-window start timestamp
-r = run("nb_telemetry_incremental", **inc("Boiler"), p_execution_date="2026-10-03T00:00:00.0000000Z")
-assert r["execution_date"] == "2026-10-03" and r["rows_written"] == 2, r
-# Day taken from the data: only the path is passed
-r = run("nb_telemetry_incremental", **inc("Turbine"))
-assert r["execution_date"] == "2026-10-03" and r["execution_date_source"] == "data" and r["rows_written"] == 1, r
-r = run("nb_telemetry_incremental", **inc("Turbine"))
-assert spark.table("silver.TAGLOG").count() == 6, spark.table("silver.TAGLOG").count()
-# Without a date, a source spanning two days fails instead of guessing
+# A source spanning two days fails instead of guessing which day to replace
 try:
     run("nb_telemetry_incremental", **inc("Boiler")); raise SystemExit("multi-day source accepted")
 except ValueError as e: print("rejected:", e)
-assert spark.table("silver.TAGLOG").count() == 6
+assert spark.table("silver.TAGLOG").count() == 3
+# Single-day source: the day comes from the data; a re-run replaces it
+r = run("nb_telemetry_incremental", **inc("Turbine")); print(r)
+assert r["load_date"] == "2026-10-03" and r["rows_written"] == 1, r
+r = run("nb_telemetry_incremental", **inc("Turbine"))
+assert spark.table("silver.TAGLOG").count() == 4, spark.table("silver.TAGLOG").count()
 spark.table("silver.TAGLOG").orderBy("Time").show()
 
 # reuse in another scenario: different folder layout, columns and target table
-write(f"{bronze}/other_source/events/2026-10-03.parquet", [("A", T("2026-10-03 08:00:00")), ("B", T("2026-10-02 08:00:00"))], ["EventCode", "EventTime"])
+write(f"{bronze}/other_source/events/2026-10-03.parquet", [("A", T("2026-10-03 08:00:00")), ("B", T("2026-10-03 09:00:00")), ("C", None)], ["EventCode", "EventTime"])
 r = run("nb_telemetry_incremental", p_source_path=f"{bronze}/other_source/events/*.parquet", p_target_table="silver.EVENTS",
-        p_plant="PlantB", p_department="Packing", p_id_column="EventCode", p_time_column="EventTime", p_execution_date="2026-10-03")
-assert r["rows_written"] == 1 and r["rows_dropped_out_of_window"] == 1, r
-assert spark.table("silver.EVENTS").count() == 1
+        p_plant="PlantB", p_department="Packing", p_id_column="EventCode", p_time_column="EventTime")
+assert r["rows_written"] == 2 and r["rows_dropped_null_time"] == 1, r
+assert spark.table("silver.EVENTS").count() == 2
 
-# window start parsing
+# target table validation
 from importlib.util import spec_from_file_location, module_from_spec
 spec = spec_from_file_location("delta_helpers", f"{ROOT}/utils/delta_helpers.py"); h = module_from_spec(spec); spec.loader.exec_module(h)
-from datetime import date
-assert h.resolve_execution_date("") is None
-for v in ["2026-10-03", "2026-10-03T00:00:00Z", "2026-10-03T00:00:00.0000000Z", "2026-10-03 00:00:00", "2026-10-03T02:00:00+02:00"]:
-    assert h.resolve_execution_date(v) == date(2026, 10, 3), v
-for v in ["2026-10-03T01:00:00Z", "2026-10-03T00:00:00+02:00", "03/10/2026"]:
-    try: h.resolve_execution_date(v); raise SystemExit(f"accepted {v}")
-    except ValueError: pass
 for v in ["silver.TAGS", "TAGS", "silver.dbo.TAGS"]:
     h.validate_table_name(v)
 for v in ["", "a.b.c.d", "silver.TAGS; DROP TABLE x", "silver..TAGS"]:
