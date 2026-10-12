@@ -22,7 +22,10 @@
 # | **Write** | append (a re-run for the same day replaces that plant/department/day slice) |
 # | **Optimize** | `OPTIMIZE ... WHERE plantname/Year/Month/Date ZORDER BY (departmentname, <p_id_column>)` |
 #
-# `p_execution_date` is the data day **X-1**; leave it empty to default to yesterday (UTC).
+# `p_execution_date` is the data day **X-1**. Pass either `YYYY-MM-DD` or the tumbling window
+# start (`@trigger().outputs.windowStartTime`, must be 00:00:00 UTC); it decides both the source
+# folder date and the `[start, start + 1 day)` filter, so re-running a failed window reloads
+# exactly that day and replaces its slice. Empty defaults to yesterday (UTC) for manual runs.
 # Attach the **Bronze** lakehouse as the default lakehouse so `Files/...` resolves.
 
 # PARAMETERS CELL ********************
@@ -31,7 +34,7 @@ p_plant          = "PlantA"
 p_department     = "Boiler"
 p_table_name     = "TAGLOG"
 p_id_column      = "TagId"
-p_execution_date = ""      # "YYYY-MM-DD" (Defaults to yesterday X-1 if empty)
+p_execution_date = ""      # "YYYY-MM-DD" or window start "YYYY-MM-DDT00:00:00Z" (Defaults to yesterday X-1 if empty)
 p_dry_run        = False
 
 # Infrastructure defaults (override from the pipeline only if the workspace layout differs)

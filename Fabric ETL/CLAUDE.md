@@ -113,7 +113,7 @@ Fabric ETL/
   p_department     = "Boiler"
   p_table_name     = "TAGLOG"
   p_id_column      = "TagId"
-  p_execution_date = ""      # "YYYY-MM-DD" (Defaults to yesterday X-1 if empty)
+  p_execution_date = ""      # "YYYY-MM-DD" or window start "YYYY-MM-DDT00:00:00Z" (Defaults to yesterday X-1 if empty)
   p_dry_run        = False
   ```
 
@@ -223,6 +223,12 @@ All identifier parameters are validated (`^[A-Za-z_][A-Za-z0-9_]*$`; plant/depar
 4. **Metadata staging.** Notebook 3 drops rows with a null business key and de-duplicates on `(plantname, departmentname, <p_id_column>)` before the MERGE, because a MERGE fails when several source rows match one target row. Schema auto-merge is enabled so new snapshot columns flow through `UPDATE SET *` / `INSERT *`. The first run creates the table from the snapshot.
 5. **Schema evolution.** Telemetry writes use `mergeSchema = true`, so a new source column is added to the Silver table rather than failing the load.
 
-### 7.4 Decisions still pending (section 6)
+### 7.4 Scheduling & reruns (Notebook 2)
+* The pipeline runs Notebook 2 from a daily **tumbling window** and passes the window start as `p_execution_date` (e.g. `@trigger().outputs.windowStartTime`).
+* The window start sets both the source folder date and the `[start, start + 1 day)` filter. It must be `00:00:00` UTC; any other value fails the run rather than loading a shifted window. Plain `YYYY-MM-DD` is still accepted for manual runs.
+* A failed window is recovered by re-running that window: the run replaces its own `plantname` + `departmentname` + `Date` slice, so reruns never duplicate rows and can be done one by one in any order.
+* Keep trigger concurrency at 1 per target table (or per plant). Two writes into the same `(plantname, Year, Month, Date)` partition at once, such as two departments of one plant on the same day, can fail with a Delta concurrent-write conflict. The failed run can simply be re-run.
+
+### 7.5 Decisions still pending (section 6)
 * `Date` is written as a `DATE` (`yyyy-MM-dd`); changing it touches only `add_time_partitions`.
 * A missing source folder fails the run (Spark `PATH_NOT_FOUND`); whether an empty day should be `NO_DATA` instead depends on the Control Layer design.

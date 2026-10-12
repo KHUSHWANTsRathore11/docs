@@ -62,10 +62,22 @@ write(f"{bronze}/ilayer_SCADA/PlantA/Boiler/2026/10/03/TAGLOG/part1.parquet", [(
 write(f"{bronze}/ilayer_SCADA/PlantA/Turbine/2026/10/03/TAGLOG/part1.parquet", [(7, T("2026-10-03 12:00:00"), 7.0)], cols)
 r = run("nb_telemetry_incremental", **base, p_execution_date="2026-10-03"); print(r)
 assert r["rows_written"] == 2 and r["rows_dropped_out_of_window"] == 1
-r = run("nb_telemetry_incremental", **base, p_execution_date="2026-10-03")
+# Re-run of the same window, passed as a tumbling-window start timestamp
+r = run("nb_telemetry_incremental", **base, p_execution_date="2026-10-03T00:00:00.0000000Z")
+assert r["execution_date"] == "2026-10-03" and r["rows_written"] == 2, r
 r = run("nb_telemetry_incremental", **base, p_execution_date="2026-10-03", p_department="Turbine")
 assert spark.table("silver.TAGLOG").count() == 6, spark.table("silver.TAGLOG").count()
 spark.table("silver.TAGLOG").orderBy("Time").show()
+
+# window start parsing
+from importlib.util import spec_from_file_location, module_from_spec
+spec = spec_from_file_location("delta_helpers", f"{ROOT}/utils/delta_helpers.py"); h = module_from_spec(spec); spec.loader.exec_module(h)
+from datetime import date
+for v in ["2026-10-03", "2026-10-03T00:00:00Z", "2026-10-03T00:00:00.0000000Z", "2026-10-03 00:00:00", "2026-10-03T02:00:00+02:00"]:
+    assert h.resolve_execution_date(v) == date(2026, 10, 3), v
+for v in ["2026-10-03T01:00:00Z", "2026-10-03T00:00:00+02:00", "03/10/2026"]:
+    try: h.resolve_execution_date(v); raise SystemExit(f"accepted {v}")
+    except ValueError: pass
 
 # metadata
 r = run("nb_metadata_sync", **base); print(r); assert r["rows_staged"] == 2
