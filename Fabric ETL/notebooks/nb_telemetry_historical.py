@@ -12,30 +12,28 @@
 
 # # nb_telemetry_historical — Historical Onboarding (Notebook 1)
 #
-# One-time onboarding load of a new `{Plant}/{Department}` from the consolidated history
-# export into Silver. Spec: `CLAUDE.md` section 3.1.
+# One-time bulk load of time-series parquet into a partitioned Delta table, e.g. onboarding a
+# new `{Plant}/{Department}` from the consolidated history export. Spec: `CLAUDE.md` section 3.1.
 #
 # | | |
 # |---|---|
-# | **Source** | `Files/rlayer_SCADA/{p_plant}/{p_department}/{Year}/{Month}/{Day}/{p_table_name}.parquet` |
-# | **Target** | `silver.<p_table_name>` partitioned by `(plantname, Year, Month, Date)` |
+# | **Source** | `p_source_path`: full path, globs allowed, e.g. `Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet` |
+# | **Target** | `p_target_table` partitioned by `(plantname, Year, Month, Date)` |
 # | **Write** | append (re-runs replace only the loaded plant/department/date range) |
 # | **Optimize** | `OPTIMIZE ... ZORDER BY (departmentname, <p_id_column>)` scoped to the loaded partitions |
 #
-# Attach the **Bronze** lakehouse as the default lakehouse so `Files/...` resolves.
+# The notebook builds no paths itself. Relative `Files/...` paths resolve against the default
+# lakehouse; `abfss://...` paths work with any lakehouse attached.
 
 # PARAMETERS CELL ********************
 
+p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet"
+p_target_table   = "silver.TAGLOG"
 p_plant          = "PlantA"
 p_department     = "Boiler"
-p_table_name     = "TAGLOG"
 p_id_column      = "TagId"
+p_time_column    = "Time"       # Event timestamp column (UTC)
 p_dry_run        = False
-
-# Infrastructure defaults (override from the pipeline only if the workspace layout differs)
-p_bronze_root     = "Files"      # Bronze lakehouse Files root (relative to default lakehouse or abfss://...)
-p_silver_database = "silver"     # Silver lakehouse / schema name
-p_time_column     = "Time"       # Event timestamp column (UTC)
 
 # CELL ********************
 
@@ -49,17 +47,13 @@ from pyspark.sql import functions as F
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 
-plant       = validate_path_segment(p_plant, "p_plant")
-department  = validate_path_segment(p_department, "p_department")
-table_name  = validate_identifier(p_table_name, "p_table_name")
-id_column   = validate_identifier(p_id_column, "p_id_column")
-time_column = validate_identifier(p_time_column, "p_time_column")
-dry_run     = to_bool(p_dry_run)
-
-target_table = qualified_table(p_silver_database, table_name)
-# {Year}/{Month}/{Day}/{TableName}.parquet under the plant/department folder. The explicit
-# depth keeps metadata snapshots (`{Plant}/{Department}/{TableName}.parquet`) out of the read.
-source_path = join_path(p_bronze_root, "rlayer_SCADA", plant, department, "*", "*", "*", f"{table_name}.parquet")
+source_path  = validate_source_path(p_source_path)
+target_table = validate_table_name(p_target_table)
+plant        = validate_label(p_plant, "p_plant")
+department   = validate_label(p_department, "p_department")
+id_column    = validate_identifier(p_id_column, "p_id_column")
+time_column  = validate_identifier(p_time_column, "p_time_column")
+dry_run      = to_bool(p_dry_run)
 
 run_started = datetime.now(timezone.utc)
 print(f"Source : {source_path}")
@@ -70,7 +64,7 @@ print(f"Dry run: {dry_run}")
 
 # Read & transform
 raw_df = spark.read.parquet(source_path)
-require_columns(raw_df, [time_column, id_column], "rlayer_SCADA source")
+require_columns(raw_df, [time_column, id_column], "source")
 
 df = add_time_partitions(add_source_columns(raw_df, plant, department), time_column)
 

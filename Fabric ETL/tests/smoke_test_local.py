@@ -48,26 +48,34 @@ write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/2026/10/02/TAGLOG.parquet", [(1, T("
 # metadata snapshot at same level must NOT be picked by historical glob
 write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", [(1, "Temp", "C", 10.0), (2, "Press", "bar", 5.0), (2, "Press", "bar", 5.0), (None, "x", "y", 0.0)], ["TagId", "Description", "Unit", "LastValue"])
 
-base = dict(p_bronze_root=bronze)
-r = run("nb_telemetry_historical", **base, p_dry_run="true"); print(r); assert r["status"] == "DRY_RUN"
+hist = dict(p_source_path=f"{bronze}/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet", p_target_table="silver.TAGLOG")
+r = run("nb_telemetry_historical", **hist, p_dry_run="true"); print(r); assert r["status"] == "DRY_RUN"
 assert not spark.catalog.tableExists("silver.TAGLOG")
-r = run("nb_telemetry_historical", **base); print(r)
+r = run("nb_telemetry_historical", **hist); print(r)
 assert r["rows_written"] == 3 and r["rows_dropped_null_time"] == 1
-r = run("nb_telemetry_historical", **base); assert spark.table("silver.TAGLOG").count() == 3, "historical rerun not idempotent"
+r = run("nb_telemetry_historical", **hist); assert spark.table("silver.TAGLOG").count() == 3, "historical rerun not idempotent"
 print(spark.sql("DESCRIBE DETAIL silver.TAGLOG").select("partitionColumns").collect())
 
 # incremental day 2026-10-03, with spillover row from 10-04
 write(f"{bronze}/ilayer_SCADA/PlantA/Boiler/2026/10/03/TAGLOG/part1.parquet", [(1, T("2026-10-03 00:00:00"), 4.0), (2, T("2026-10-03 23:59:59"), 5.0), (2, T("2026-10-04 00:00:00"), 6.0)], cols)
 # second department, same plant
 write(f"{bronze}/ilayer_SCADA/PlantA/Turbine/2026/10/03/TAGLOG/part1.parquet", [(7, T("2026-10-03 12:00:00"), 7.0)], cols)
-r = run("nb_telemetry_incremental", **base, p_execution_date="2026-10-03"); print(r)
+inc = lambda dept: dict(p_source_path=f"{bronze}/ilayer_SCADA/PlantA/{dept}/2026/10/03/TAGLOG/*.parquet", p_target_table="silver.TAGLOG", p_department=dept)
+r = run("nb_telemetry_incremental", **inc("Boiler"), p_execution_date="2026-10-03"); print(r)
 assert r["rows_written"] == 2 and r["rows_dropped_out_of_window"] == 1
 # Re-run of the same window, passed as a tumbling-window start timestamp
-r = run("nb_telemetry_incremental", **base, p_execution_date="2026-10-03T00:00:00.0000000Z")
+r = run("nb_telemetry_incremental", **inc("Boiler"), p_execution_date="2026-10-03T00:00:00.0000000Z")
 assert r["execution_date"] == "2026-10-03" and r["rows_written"] == 2, r
-r = run("nb_telemetry_incremental", **base, p_execution_date="2026-10-03", p_department="Turbine")
+r = run("nb_telemetry_incremental", **inc("Turbine"), p_execution_date="2026-10-03")
 assert spark.table("silver.TAGLOG").count() == 6, spark.table("silver.TAGLOG").count()
 spark.table("silver.TAGLOG").orderBy("Time").show()
+
+# reuse in another scenario: different folder layout, columns and target table
+write(f"{bronze}/other_source/events/2026-10-03.parquet", [("A", T("2026-10-03 08:00:00")), ("B", T("2026-10-02 08:00:00"))], ["EventCode", "EventTime"])
+r = run("nb_telemetry_incremental", p_source_path=f"{bronze}/other_source/events/*.parquet", p_target_table="silver.EVENTS",
+        p_plant="PlantB", p_department="Packing", p_id_column="EventCode", p_time_column="EventTime", p_execution_date="2026-10-03")
+assert r["rows_written"] == 1 and r["rows_dropped_out_of_window"] == 1, r
+assert spark.table("silver.EVENTS").count() == 1
 
 # window start parsing
 from importlib.util import spec_from_file_location, module_from_spec
@@ -78,15 +86,22 @@ for v in ["2026-10-03", "2026-10-03T00:00:00Z", "2026-10-03T00:00:00.0000000Z", 
 for v in ["2026-10-03T01:00:00Z", "2026-10-03T00:00:00+02:00", "03/10/2026"]:
     try: h.resolve_execution_date(v); raise SystemExit(f"accepted {v}")
     except ValueError: pass
+for v in ["silver.TAGS", "TAGS", "silver.dbo.TAGS"]:
+    h.validate_table_name(v)
+for v in ["", "a.b.c.d", "silver.TAGS; DROP TABLE x", "silver..TAGS"]:
+    try: h.validate_table_name(v); raise SystemExit(f"accepted {v}")
+    except ValueError: pass
 
 # metadata
-r = run("nb_metadata_sync", **base); print(r); assert r["rows_staged"] == 2
+meta = dict(p_source_path=f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", p_target_table="silver.TAGS")
+r = run("nb_metadata_sync", **meta); print(r); assert r["rows_staged"] == 2
 write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", [(1, "Temp", "K", 11.0), (3, "Flow", "m3", 1.0)], ["TagId", "Description", "Unit", "LastValue"])
-r = run("nb_metadata_sync", **base); print(r)
+r = run("nb_metadata_sync", **meta); print(r)
 spark.table("silver.TAGS").orderBy("TagId").show()
 rows = {x.TagId: x.Unit for x in spark.table("silver.TAGS").collect()}
 assert rows == {1: "K", 2: "bar", 3: "m3"}, rows
-try:
-    run("nb_metadata_sync", **base, p_table_name="TAGS; DROP TABLE x"); raise SystemExit("validation failed")
-except ValueError as e: print("rejected:", e)
+for bad in [dict(p_target_table="silver.TAGS; DROP TABLE x"), dict(p_source_path="")]:
+    try:
+        run("nb_metadata_sync", **{**meta, **bad}); raise SystemExit(f"validation failed for {bad}")
+    except ValueError as e: print("rejected:", e)
 print("ALL OK")

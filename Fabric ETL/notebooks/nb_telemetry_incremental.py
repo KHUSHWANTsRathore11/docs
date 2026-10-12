@@ -17,31 +17,30 @@
 #
 # | | |
 # |---|---|
-# | **Source** | `Files/ilayer_SCADA/{p_plant}/{p_department}/{Year}/{Month}/{Day}/{p_table_name}/*.parquet` |
-# | **Target** | `silver.<p_table_name>` partitioned by `(plantname, Year, Month, Date)` |
+# | **Source** | `p_source_path`: full path, globs allowed, e.g. `Files/ilayer_SCADA/PlantA/Boiler/2026/10/11/TAGLOG/*.parquet` |
+# | **Target** | `p_target_table` partitioned by `(plantname, Year, Month, Date)` |
 # | **Write** | append (a re-run for the same day replaces that plant/department/day slice) |
 # | **Optimize** | `OPTIMIZE ... WHERE plantname/Year/Month/Date ZORDER BY (departmentname, <p_id_column>)` |
 #
-# `p_execution_date` is the data day **X-1**. Pass either `YYYY-MM-DD` or the tumbling window
-# start (`@trigger().outputs.windowStartTime`, must be 00:00:00 UTC); it decides both the source
-# folder date and the `[start, start + 1 day)` filter, so re-running a failed window reloads
-# exactly that day and replaces its slice. Empty defaults to yesterday (UTC) for manual runs.
-# Attach the **Bronze** lakehouse as the default lakehouse so `Files/...` resolves.
+# The caller builds `p_source_path` for the window (e.g. from the tumbling window start).
+# `p_execution_date` is the data day **X-1**, as `YYYY-MM-DD` or the window start timestamp
+# (must be 00:00:00 UTC). It drives the `[start, start + 1 day)` filter and the Silver slice that
+# is replaced, so re-running a failed window reloads exactly that day. Empty defaults to
+# yesterday (UTC) for manual runs.
+#
+# Relative `Files/...` paths resolve against the default lakehouse; `abfss://...` paths work
+# with any lakehouse attached.
 
 # PARAMETERS CELL ********************
 
+p_source_path    = "Files/ilayer_SCADA/PlantA/Boiler/2026/10/11/TAGLOG/*.parquet"
+p_target_table   = "silver.TAGLOG"
 p_plant          = "PlantA"
 p_department     = "Boiler"
-p_table_name     = "TAGLOG"
 p_id_column      = "TagId"
-p_execution_date = ""      # "YYYY-MM-DD" or window start "YYYY-MM-DDT00:00:00Z" (Defaults to yesterday X-1 if empty)
+p_time_column    = "Time"   # Event timestamp column (UTC)
+p_execution_date = ""       # "YYYY-MM-DD" or window start "YYYY-MM-DDT00:00:00Z" (Defaults to yesterday X-1 if empty)
 p_dry_run        = False
-
-# Infrastructure defaults (override from the pipeline only if the workspace layout differs)
-p_bronze_root     = "Files"      # Bronze lakehouse Files root (relative to default lakehouse or abfss://...)
-p_silver_database = "silver"     # Silver lakehouse / schema name
-p_time_column     = "Time"       # Event timestamp column (UTC)
-p_zero_pad_dates  = True         # Folder layout 2026/01/05 (True) vs 2026/1/5 (False)
 
 # CELL ********************
 
@@ -55,21 +54,16 @@ from pyspark.sql import functions as F
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 
-plant       = validate_path_segment(p_plant, "p_plant")
-department  = validate_path_segment(p_department, "p_department")
-table_name  = validate_identifier(p_table_name, "p_table_name")
-id_column   = validate_identifier(p_id_column, "p_id_column")
-time_column = validate_identifier(p_time_column, "p_time_column")
-dry_run     = to_bool(p_dry_run)
+source_path  = validate_source_path(p_source_path)
+target_table = validate_table_name(p_target_table)
+plant        = validate_label(p_plant, "p_plant")
+department   = validate_label(p_department, "p_department")
+id_column    = validate_identifier(p_id_column, "p_id_column")
+time_column  = validate_identifier(p_time_column, "p_time_column")
+dry_run      = to_bool(p_dry_run)
 
 target_date = resolve_execution_date(p_execution_date)
 window_start, window_end = utc_day_window(target_date)
-
-target_table = qualified_table(p_silver_database, table_name)
-source_path = join_path(
-    p_bronze_root, "ilayer_SCADA", plant, department,
-    date_path(target_date, to_bool(p_zero_pad_dates)), table_name, "*.parquet",
-)
 
 run_started = datetime.now(timezone.utc)
 print(f"Source : {source_path}")
@@ -81,12 +75,12 @@ print(f"Dry run: {dry_run}")
 
 # Read & transform
 raw_df = spark.read.parquet(source_path)
-require_columns(raw_df, [time_column, id_column], "ilayer_SCADA source")
+require_columns(raw_df, [time_column, id_column], "source")
 
 df = add_time_partitions(add_source_columns(raw_df, plant, department), time_column)
 
-# Keep strictly the [X-1, X) window: intraday chunks can carry rows from neighbouring days,
-# and every written row must belong to the replaced Date partition.
+# Keep strictly the [X-1, X) window: the source can carry rows from neighbouring days (or be a
+# wider glob), and every written row must belong to the replaced Date partition.
 # Bounds are cast from strings so they are interpreted in the UTC session time zone,
 # independent of the driver's local time zone.
 start_ts = F.lit(window_start.strftime("%Y-%m-%d %H:%M:%S")).cast("timestamp")

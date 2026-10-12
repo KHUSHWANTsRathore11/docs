@@ -12,30 +12,28 @@
 
 # # nb_metadata_sync — Daily Metadata Sync, SCD Type 1 (Notebook 3)
 #
-# Daily sync of a metadata / configuration table (e.g. `TAGS`) from its full snapshot export.
+# Daily sync of a metadata / configuration table (e.g. `TAGS`) from a full snapshot.
 # Spec: `CLAUDE.md` section 3.3.
 #
 # | | |
 # |---|---|
-# | **Source** | `Files/rlayer_SCADA/{p_plant}/{p_department}/{p_table_name}.parquet` (daily full snapshot) |
-# | **Target** | `silver.<p_table_name>` |
+# | **Source** | `p_source_path`: full path, e.g. `Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet` (daily full snapshot) |
+# | **Target** | `p_target_table` |
 # | **Write** | Delta `MERGE` on `(plantname, departmentname, <p_id_column>)`: update matched, insert new |
 #
 # Tags that disappear from the snapshot are left as they are (retirement handling is a future
 # evolution, see `CLAUDE.md` section 5.2).
-# Attach the **Bronze** lakehouse as the default lakehouse so `Files/...` resolves.
+# Relative `Files/...` paths resolve against the default lakehouse; `abfss://...` paths work
+# with any lakehouse attached.
 
 # PARAMETERS CELL ********************
 
+p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
+p_target_table   = "silver.TAGS"
 p_plant          = "PlantA"
 p_department     = "Boiler"
-p_table_name     = "TAGS"
 p_id_column      = "TagId"
 p_dry_run        = False
-
-# Infrastructure defaults (override from the pipeline only if the workspace layout differs)
-p_bronze_root     = "Files"      # Bronze lakehouse Files root (relative to default lakehouse or abfss://...)
-p_silver_database = "silver"     # Silver lakehouse / schema name
 
 # CELL ********************
 
@@ -49,14 +47,13 @@ from pyspark.sql import functions as F
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 
-plant      = validate_path_segment(p_plant, "p_plant")
-department = validate_path_segment(p_department, "p_department")
-table_name = validate_identifier(p_table_name, "p_table_name")
-id_column  = validate_identifier(p_id_column, "p_id_column")
-dry_run    = to_bool(p_dry_run)
+source_path  = validate_source_path(p_source_path)
+target_table = validate_table_name(p_target_table)
+plant        = validate_label(p_plant, "p_plant")
+department   = validate_label(p_department, "p_department")
+id_column    = validate_identifier(p_id_column, "p_id_column")
+dry_run      = to_bool(p_dry_run)
 
-target_table = qualified_table(p_silver_database, table_name)
-source_path = join_path(p_bronze_root, "rlayer_SCADA", plant, department, f"{table_name}.parquet")
 key_columns = [PLANT_COLUMN, DEPARTMENT_COLUMN, id_column]
 
 run_started = datetime.now(timezone.utc)

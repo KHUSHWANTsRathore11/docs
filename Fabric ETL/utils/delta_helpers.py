@@ -55,11 +55,31 @@ def validate_identifier(value: str, name: str) -> str:
     return value
 
 
-def validate_path_segment(value: str, name: str) -> str:
-    """Plant / department names are used as folder names and literals; allow `-` and spaces."""
+def validate_label(value: str, name: str) -> str:
+    """Plant / department names are written as column values and predicate literals.
+
+    Allows spaces and `-`, rejects quotes, slashes and glob characters.
+    """
     if not isinstance(value, str) or not value.strip() or re.search(r"[/\\'\"*?\[\]{}]", value):
-        raise ValueError(f"Parameter {name}={value!r} is not a valid path segment")
+        raise ValueError(f"Parameter {name}={value!r} is not a valid label")
     return value
+
+
+def validate_table_name(value: str, name: str = "p_target_table") -> str:
+    """Target table as `table`, `lakehouse.table` or `lakehouse.schema.table`."""
+    parts = value.split(".") if isinstance(value, str) else []
+    if not 1 <= len(parts) <= 3:
+        raise ValueError(f"Parameter {name}={value!r} must be table, lakehouse.table or lakehouse.schema.table")
+    for part in parts:
+        validate_identifier(part, name)
+    return value
+
+
+def validate_source_path(value: str, name: str = "p_source_path") -> str:
+    """The full source path is handed to Spark as is; it only has to be present."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Parameter {name} is required (full source path, globs allowed)")
+    return value.strip()
 
 
 def to_bool(value) -> bool:
@@ -80,12 +100,8 @@ def sql_literal(value) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def qualified_table(database: str, table_name: str) -> str:
-    return f"{validate_identifier(database, 'database')}.{validate_identifier(table_name, 'table_name')}"
-
-
 # ---------------------------------------------------------------------------
-# Dates & paths
+# Dates
 # ---------------------------------------------------------------------------
 
 def resolve_execution_date(p_execution_date: str) -> date:
@@ -127,21 +143,6 @@ def utc_day_window(day: date):
     """Half-open window [day 00:00:00 UTC, day+1 00:00:00 UTC)."""
     start = datetime(day.year, day.month, day.day)
     return start, start + timedelta(days=1)
-
-
-def date_path(day: date, zero_pad: bool = True) -> str:
-    """`{Year}/{Month}/{Day}` folder fragment of the SCADA export layout."""
-    if zero_pad:
-        return f"{day.year:04d}/{day.month:02d}/{day.day:02d}"
-    return f"{day.year}/{day.month}/{day.day}"
-
-
-def join_path(*parts: str) -> str:
-    """Join path segments, keeping a leading `/` or `abfss://` prefix on the first one."""
-    parts = [str(p) for p in parts if p is not None and str(p) != ""]
-    if not parts:
-        return ""
-    return "/".join([parts[0].rstrip("/")] + [p.strip("/") for p in parts[1:]])
 
 
 # ---------------------------------------------------------------------------

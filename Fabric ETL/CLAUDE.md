@@ -62,8 +62,8 @@ Fabric ETL/
 ### 3.1 Notebook 1: `nb_telemetry_historical` (Historical Onboarding)
 
 * **Purpose**: One-time onboarding load for any new `{Plant}/{Department}`.
-* **Source**: `Files/rlayer_SCADA/{p_plant}/{p_department}/**/{p_table_name}.parquet`
-* **Target**: `silver.<p_table_name>`
+* **Source**: `p_source_path`, the full path passed by the caller (globs allowed), e.g. `Files/rlayer_SCADA/{Plant}/{Department}/*/*/*/{TableName}.parquet`
+* **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
 * **Transformation & Partitioning**:
   * Derives `plantname = lit(p_plant)`, `departmentname = lit(p_department)`.
@@ -72,16 +72,18 @@ Fabric ETL/
 * **Optimization**:
   * Runs scoped Z-Order:
     ```sql
-    OPTIMIZE silver.<p_table_name>
+    OPTIMIZE <p_target_table>
     WHERE plantname = '{p_plant}' AND departmentname = '{p_department}'
     ZORDER BY (departmentname, <p_id_column>);
     ```
 * **Parameters**:
   ```python
+  p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet"
+  p_target_table   = "silver.TAGLOG"
   p_plant          = "PlantA"
   p_department     = "Boiler"
-  p_table_name     = "TAGLOG"
   p_id_column      = "TagId"
+  p_time_column    = "Time"
   p_dry_run        = False
   ```
 
@@ -90,8 +92,8 @@ Fabric ETL/
 ### 3.2 Notebook 2: `nb_telemetry_incremental` (Daily Incremental)
 
 * **Purpose**: Scheduled daily run triggered at `X 00:00:00 UTC` to process telemetry from `[X-1 00:00:00 UTC, X 00:00:00 UTC)`.
-* **Source**: `Files/ilayer_SCADA/{p_plant}/{p_department}/{Year}/{Month}/{Day}/{p_table_name}/*.parquet` (dynamically constructed using target date window).
-* **Target**: `silver.<p_table_name>`
+* **Source**: `p_source_path`, the full path built by the pipeline from the tumbling window start, e.g. `Files/ilayer_SCADA/{Plant}/{Department}/{Year}/{Month}/{Day}/{TableName}/*.parquet`.
+* **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
 * **Transformation & Partitioning**:
   * Injects `plantname` and `departmentname`.
@@ -100,7 +102,7 @@ Fabric ETL/
 * **Optimization**:
   * Runs partition-scoped Z-Order for the processed date:
     ```sql
-    OPTIMIZE silver.<p_table_name>
+    OPTIMIZE <p_target_table>
     WHERE plantname = '{p_plant}' 
       AND Year = {target_year} 
       AND Month = {target_month} 
@@ -109,10 +111,12 @@ Fabric ETL/
     ```
 * **Parameters**:
   ```python
+  p_source_path    = "Files/ilayer_SCADA/PlantA/Boiler/2026/10/11/TAGLOG/*.parquet"
+  p_target_table   = "silver.TAGLOG"
   p_plant          = "PlantA"
   p_department     = "Boiler"
-  p_table_name     = "TAGLOG"
   p_id_column      = "TagId"
+  p_time_column    = "Time"
   p_execution_date = ""      # "YYYY-MM-DD" or window start "YYYY-MM-DDT00:00:00Z" (Defaults to yesterday X-1 if empty)
   p_dry_run        = False
   ```
@@ -122,13 +126,13 @@ Fabric ETL/
 ### 3.3 Notebook 3: `nb_metadata_sync` (Daily Metadata Sync - SCD Type 1)
 
 * **Purpose**: Daily sync of metadata / configuration tables (e.g., `TAGS`).
-* **Source**: `Files/rlayer_SCADA/{p_plant}/{p_department}/{p_table_name}.parquet` (Daily full snapshot).
-* **Target**: `silver.<p_table_name>`
+* **Source**: `p_source_path`, the full path of the daily full snapshot, e.g. `Files/rlayer_SCADA/{Plant}/{Department}/{TableName}.parquet`.
+* **Target**: `p_target_table`, e.g. `silver.TAGS`
 * **Implementation Strategy**: **SCD Type 1 (Delta `MERGE` on Primary Key)**.
   * Natural/Business Key: `(plantname, departmentname, <p_id_column>)`.
   * Merge Pattern:
     ```sql
-    MERGE INTO silver.<p_table_name> AS target
+    MERGE INTO <p_target_table> AS target
     USING staged_daily_metadata AS source
     ON target.plantname = source.plantname 
        AND target.departmentname = source.departmentname 
@@ -140,9 +144,10 @@ Fabric ETL/
     ```
 * **Parameters**:
   ```python
+  p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
+  p_target_table   = "silver.TAGS"
   p_plant          = "PlantA"
   p_department     = "Boiler"
-  p_table_name     = "TAGS"
   p_id_column      = "TagId"
   p_dry_run        = False
   ```
@@ -154,6 +159,7 @@ Fabric ETL/
 * **No Static Config Files**: Configuration is metadata-driven via the upstream Control Layer.
 * **Decoupled Notebooks**:
   * Fabric Data Factory / Pipelines extract metadata and pass parameters to Notebooks.
+  * Notebooks build **no paths and no table names**: the caller passes the full source path (`p_source_path`) and the full target table (`p_target_table`), so the same notebooks serve any source layout or target.
   * Notebooks contain **no hardcoded SQL connection strings** or database drivers.
   * Notebooks support **standalone / manual execution** with default fallback parameters.
 
@@ -203,18 +209,21 @@ decide something the spec left open, or the spec could not run as written, it is
 ### 7.1 Notebook format & shared code
 * Files use the Fabric notebook source format (`# Fabric notebook source`, `# PARAMETERS CELL`, `# CELL`), so they import into a Fabric workspace as notebooks and remain valid Python.
 * `utils/delta_helpers.py` is imported as a notebook named `delta_helpers`; each ETL notebook pulls it in with `%run delta_helpers`.
-* Attach the **Bronze** lakehouse as the default lakehouse; Silver is addressed as `<p_silver_database>.<p_table_name>` (default `silver`).
+* Relative `Files/...` source paths resolve against the default lakehouse (attach Bronze); `abfss://...` paths work with any lakehouse attached. The target is addressed exactly as passed in `p_target_table`.
 * Each notebook ends with `notebookutils.notebook.exit(<json>)` carrying status (`SUCCEEDED` / `DRY_RUN` / `NO_DATA`), row counts and timings, for the pipeline / Control Layer to log.
 
-### 7.2 Extra parameters (all optional, with defaults)
-| Parameter | Default | Notebooks | Purpose |
-|---|---|---|---|
-| `p_bronze_root` | `"Files"` | all | Bronze `Files` root (relative path or `abfss://...`) |
-| `p_silver_database` | `"silver"` | all | Silver lakehouse / schema name |
-| `p_time_column` | `"Time"` | 1, 2 | Event timestamp column (UTC) |
-| `p_zero_pad_dates` | `True` | 2 | Folder layout `2026/01/05` vs `2026/1/5` |
+### 7.2 Generic parameters
+The notebooks take full locations instead of building them, so they can be reused for other sources and targets:
 
-All identifier parameters are validated (`^[A-Za-z_][A-Za-z0-9_]*$`; plant/department may not contain path or quote characters) since they are interpolated into paths and predicates.
+| Parameter | Notebooks | Purpose |
+|---|---|---|
+| `p_source_path` | all | Full source path handed to `spark.read.parquet` as is; globs allowed (`*`, `{a,b}`) |
+| `p_target_table` | all | Target Delta table: `table`, `lakehouse.table` or `lakehouse.schema.table` |
+| `p_plant`, `p_department` | all | Values written to `plantname` / `departmentname` (partition and merge keys) |
+| `p_id_column` | all | Z-Order column (1, 2) / business key (3) |
+| `p_time_column` | 1, 2 | Event timestamp column (UTC), default `Time` |
+
+`p_target_table` and the column names are validated as identifiers (`^[A-Za-z_][A-Za-z0-9_]*$` per part), and plant/department may not contain quote, slash or glob characters, since they are interpolated into predicates. `p_source_path` is not interpreted by the notebooks.
 
 ### 7.3 Deviations from the section 3 spec
 1. **Notebook 1 OPTIMIZE scope.** Delta only accepts partition columns in `OPTIMIZE ... WHERE`, and `departmentname` is not a partition column, so the spec's predicate fails. The notebook scopes by `plantname` and the loaded `Date` range; `departmentname` is still clustered by the Z-Order.
@@ -224,11 +233,11 @@ All identifier parameters are validated (`^[A-Za-z_][A-Za-z0-9_]*$`; plant/depar
 5. **Schema evolution.** Telemetry writes use `mergeSchema = true`, so a new source column is added to the Silver table rather than failing the load.
 
 ### 7.4 Scheduling & reruns (Notebook 2)
-* The pipeline runs Notebook 2 from a daily **tumbling window** and passes the window start as `p_execution_date` (e.g. `@trigger().outputs.windowStartTime`).
-* The window start sets both the source folder date and the `[start, start + 1 day)` filter. It must be `00:00:00` UTC; any other value fails the run rather than loading a shifted window. Plain `YYYY-MM-DD` is still accepted for manual runs.
+* The pipeline runs Notebook 2 from a daily **tumbling window**. It builds `p_source_path` for the window's day and passes the window start as `p_execution_date` (e.g. `@trigger().outputs.windowStartTime`).
+* The window start sets the `[start, start + 1 day)` filter and the Silver slice that is replaced; the source path does not need to match it exactly, since rows outside the window are dropped. It must be `00:00:00` UTC; any other value fails the run rather than loading a shifted window. Plain `YYYY-MM-DD` is still accepted for manual runs.
 * A failed window is recovered by re-running that window: the run replaces its own `plantname` + `departmentname` + `Date` slice, so reruns never duplicate rows and can be done one by one in any order.
 * Keep trigger concurrency at 1 per target table (or per plant). Two writes into the same `(plantname, Year, Month, Date)` partition at once, such as two departments of one plant on the same day, can fail with a Delta concurrent-write conflict. The failed run can simply be re-run.
 
 ### 7.5 Decisions still pending (section 6)
 * `Date` is written as a `DATE` (`yyyy-MM-dd`); changing it touches only `add_time_partitions`.
-* A missing source folder fails the run (Spark `PATH_NOT_FOUND`); whether an empty day should be `NO_DATA` instead depends on the Control Layer design.
+* A missing source path fails the run (Spark `PATH_NOT_FOUND`); whether an empty day should be `NO_DATA` instead depends on the Control Layer design.
