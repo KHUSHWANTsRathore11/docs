@@ -37,7 +37,7 @@ p_dry_run        = False
 
 # CELL ********************
 
-# MAGIC %run delta_helpers
+# MAGIC %run nb_lib_delta_helpers
 
 # CELL ********************
 

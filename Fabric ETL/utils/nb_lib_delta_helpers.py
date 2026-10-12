@@ -10,13 +10,13 @@
 
 # MARKDOWN ********************
 
-# # delta_helpers
+# # nb_lib_delta_helpers
 #
 # Shared logic for the Bronze -> Silver notebooks (see `../CLAUDE.md`, section 3).
 #
-# * Fabric: import this file as a notebook named `delta_helpers` and pull it into the ETL
-#   notebooks with `%run delta_helpers`.
-# * Local / tests: it is plain Python, so `import delta_helpers` works as well.
+# * Fabric: import this file as a notebook named `nb_lib_delta_helpers` and pull it into the ETL
+#   notebooks with `%run nb_lib_delta_helpers`.
+# * Local / tests: it is plain Python, so `import nb_lib_delta_helpers` works as well.
 #
 # The helpers contain no connection strings, no hardcoded plants/tables and no I/O side
 # effects beyond the Spark session they are given.
@@ -161,7 +161,7 @@ def zorder_optimize(spark: SparkSession, full_table_name: str, where: str, zorde
     if where:
         sql += f" WHERE {where}"
     sql += f" ZORDER BY ({cols})"
-    print(f"[delta_helpers] {sql}")
+    print(f"[nb_lib_delta_helpers] {sql}")
     spark.sql(sql)
 
 

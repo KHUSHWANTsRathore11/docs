@@ -17,11 +17,11 @@ spark = configure_spark_with_delta_pip(SparkSession.builder.master("local[2]")
 spark.sparkContext.setLogLevel("ERROR")
 spark.sql("CREATE DATABASE silver")
 bronze = f"{work}/bronze"
-helpers = open(f"{ROOT}/utils/delta_helpers.py").read()
+helpers = open(f"{ROOT}/utils/nb_lib_delta_helpers.py").read()
 
 def run(nb, **params):
     src = open(f"{ROOT}/notebooks/{nb}.py").read()
-    src = src.replace("# MAGIC %run delta_helpers", helpers)
+    src = src.replace("# MAGIC %run nb_lib_delta_helpers", helpers)
     # Overrides go right after the parameters cell, as Fabric's injected parameters cell does.
     head, tail = src.split("# CELL ********************", 1)
     override = "\n".join(f"{k} = {v!r}" for k, v in params.items())
@@ -85,7 +85,7 @@ except ValueError as e: print("rejected:", e)
 
 # target table validation
 from importlib.util import spec_from_file_location, module_from_spec
-spec = spec_from_file_location("delta_helpers", f"{ROOT}/utils/delta_helpers.py"); h = module_from_spec(spec); spec.loader.exec_module(h)
+spec = spec_from_file_location("nb_lib_delta_helpers", f"{ROOT}/utils/nb_lib_delta_helpers.py"); h = module_from_spec(spec); spec.loader.exec_module(h)
 for v in ["silver.TAGS", "TAGS", "silver.dbo.TAGS"]:
     h.validate_table_name(v)
 for v in ["", "a.b.c.d", "silver.TAGS; DROP TABLE x", "silver..TAGS"]:

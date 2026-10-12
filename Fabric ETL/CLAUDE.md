@@ -52,7 +52,7 @@ Fabric ETL/
 │   ├── nb_telemetry_incremental.py  <-- [Notebook 2] Daily scheduled incremental [X-1, X)
 │   └── nb_metadata_sync.py          <-- [Notebook 3] Daily SCD1 metadata/dimension sync
 ├── utils/
-│   └── delta_helpers.py             <-- Shared logic (partition derivation, Z-Order)
+│   └── nb_lib_delta_helpers.py      <-- Shared logic (partition derivation, Z-Order)
 └── tests/
     └── smoke_test_local.py          <-- Local PySpark + Delta end-to-end test
 ```
@@ -208,7 +208,9 @@ decide something the spec left open, or the spec could not run as written, it is
 
 ### 7.1 Notebook format & shared code
 * Files use the Fabric notebook source format (`# Fabric notebook source`, `# PARAMETERS CELL`, `# CELL`), so they import into a Fabric workspace as notebooks and remain valid Python.
-* `utils/delta_helpers.py` is imported as a notebook named `delta_helpers`; each ETL notebook pulls it in with `%run delta_helpers`.
+* `utils/nb_lib_delta_helpers.py` is imported as a notebook named `nb_lib_delta_helpers`; each ETL notebook pulls it in with `%run nb_lib_delta_helpers`.
+  * `%run` resolves the notebook by name within the same workspace when the cell runs and executes it in the caller's Spark session (no extra session or pool). Names are unique per workspace, renames are not propagated to `%run` cells, and each workspace (dev / test / prod) needs its own copy.
+  * Shared helpers use the `nb_lib_` prefix. The helpers are workload-agnostic and shared by every workload in the workspace; workload-specific logic goes in its own `nb_lib_<workload>_helpers` notebook rather than changing existing shared functions.
 * Relative `Files/...` source paths resolve against the default lakehouse (attach Bronze); `abfss://...` paths work with any lakehouse attached. The target is addressed exactly as passed in `p_target_table`.
 * Each notebook ends with `notebookutils.notebook.exit(<json>)` carrying status (`SUCCEEDED` / `DRY_RUN` / `NO_DATA`), row counts and timings, for the pipeline / Control Layer to log.
 
