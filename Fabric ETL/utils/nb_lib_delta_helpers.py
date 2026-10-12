@@ -95,8 +95,7 @@ def add_time_columns(df: DataFrame, time_column: str = "Time") -> DataFrame:
     `Date` is a DATE (yyyy-MM-dd). The string-vs-integer-day choice is still an open topic
     (CLAUDE.md section 6.1); changing it only requires changing this function.
     """
-    if time_column not in df.columns:
-        raise ValueError(f"Time column {time_column!r} not found in source; columns: {df.columns}")
+    (time_column,) = require_columns(df, [time_column], "time column")
     ts = F.col(time_column).cast("timestamp")
     return (
         df.withColumn(time_column, ts)
@@ -111,10 +110,16 @@ def telemetry_cluster_columns(plant_column: str, dept_column: str, id_column: st
     return ["Date", plant_column, dept_column, id_column]
 
 
-def require_columns(df: DataFrame, columns, context: str) -> None:
-    missing = [c for c in columns if c not in df.columns]
+def require_columns(df: DataFrame, columns, context: str) -> list:
+    """Check the columns exist, ignoring case like Spark does, and return their actual names.
+
+    Callers use the returned names, so a parameter `TagId` works against a source `TagID`.
+    """
+    actual = {c.lower(): c for c in df.columns}
+    missing = [c for c in columns if c.lower() not in actual]
     if missing:
         raise ValueError(f"{context}: missing required column(s) {missing}; available: {df.columns}")
+    return [actual[c.lower()] for c in columns]
 
 
 # ---------------------------------------------------------------------------

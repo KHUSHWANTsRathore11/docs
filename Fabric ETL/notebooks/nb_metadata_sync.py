@@ -55,19 +55,18 @@ dept_column  = validate_identifier(p_department_column, "p_department_column")
 id_column    = validate_identifier(p_id_column, "p_id_column")
 dry_run      = to_bool(p_dry_run)
 
-key_columns = [plant_column, dept_column, id_column]
-
 run_started = datetime.now(timezone.utc)
 print(f"Source : {source_path}")
 print(f"Target : {target_table}")
-print(f"Key    : {key_columns}")
 print(f"Dry run: {dry_run}")
 
 # CELL ********************
 
 # Read & stage the snapshot
 raw_df = spark.read.parquet(source_path)
-require_columns(raw_df, key_columns, "metadata snapshot")
+key_columns = require_columns(raw_df, [plant_column, dept_column, id_column], "metadata snapshot")
+plant_column, dept_column, id_column = key_columns
+print(f"Key    : {key_columns}")
 
 staged = raw_df
 rows_read = staged.count()

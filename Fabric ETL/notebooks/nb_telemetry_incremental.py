@@ -66,7 +66,9 @@ print(f"Dry run: {dry_run}")
 
 # Read & transform
 raw_df = spark.read.parquet(source_path)
-require_columns(raw_df, [plant_column, dept_column, time_column, id_column], "source")
+plant_column, dept_column, time_column, id_column = require_columns(
+    raw_df, [plant_column, dept_column, time_column, id_column], "source"
+)
 
 df = add_time_columns(raw_df, time_column)
 cluster_columns = telemetry_cluster_columns(plant_column, dept_column, id_column)

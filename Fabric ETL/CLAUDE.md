@@ -41,16 +41,17 @@ Source shortcuts are located under `Files/` in the Bronze Lakehouse:
 
 ---
 
-## 3. Bronze to Silver ETL Pipelines (3-Notebook Architecture)
+## 3. Bronze to Silver ETL Pipelines (Modular Notebooks)
 
-To maintain strict separation of concerns, high maintainability, and clean pipeline debugging, the Bronze $\rightarrow$ Silver processing is implemented across exactly **3 Modular Notebooks**:
+To maintain strict separation of concerns, high maintainability, and clean pipeline debugging, the Bronze $\rightarrow$ Silver processing is implemented across **3 Modular Notebooks**, plus a Silver $\rightarrow$ Silver notebook for spool boundaries:
 
 ```
 Fabric ETL/
 ├── notebooks/
 │   ├── nb_telemetry_historical.py   <-- [Notebook 1] One-time onboarding load
 │   ├── nb_telemetry_incremental.py  <-- [Notebook 2] Daily scheduled incremental [X-1, X)
-│   └── nb_metadata_sync.py          <-- [Notebook 3] Daily SCD1 metadata/dimension sync
+│   ├── nb_metadata_sync.py          <-- [Notebook 3] Daily SCD1 metadata/dimension sync
+│   └── nb_spool_boundaries.py       <-- [Notebook 4] Daily spool boundaries from LASTSpoolPV (Silver -> Silver)
 ├── utils/
 │   └── nb_lib_delta_helpers.py      <-- Shared logic (time columns, clustering, Z-Order, merge)
 └── tests/
@@ -142,6 +143,55 @@ Fabric ETL/
 
 ---
 
+### 3.4 Notebook 4: `nb_spool_boundaries` (Spool Boundaries)
+
+* **Purpose**: one row per spool, so spool characteristics can be derived from `TAGLOG` without changing it. Runs daily after Notebooks 2 and 3.
+* **Why a separate table** instead of a `SpoolId` column on `TAGLOG`: a reading's spool is only known when the spool ends (possibly the next day), so stamping it would turn the append-only telemetry table into a daily `MERGE` over its largest data; boundary corrections would rewrite telemetry; and not every tag belongs to a spool.
+* **Spool tags**: one LASTSpoolPV tag per machine/line/position, found in `TAGS` by `Description = p_spool_tag_description` (trimmed, case-insensitive), never by a hardcoded `TagId`. `(PlantName, DepartmentName, TagId)` of that tag identifies the spool series; nothing lower-level is modelled.
+* **Boundaries**: every telemetry row of a spool tag is a spool end. A spool covers `SpoolStartTime < Time <= SpoolEndTime`, where the start is the previous end of the same tag; the first event of a tag has a null start.
+* **Target**: `p_target_table` (e.g. `silver.SPOOL`):
+
+  | Column | Meaning |
+  |---|---|
+  | `SpoolKey` | SHA-256 of `PlantName\|DepartmentName\|SpoolTagId\|SpoolEndTime` |
+  | `PlantName`, `DepartmentName`, `SpoolTagId` | the spool series (one per machine/line/position) |
+  | `SpoolStartTime`, `SpoolEndTime` | `(previous end, this end]` |
+  | `LastSpoolPV` | the LASTSpoolPV value at the spool end |
+  | `DurationSec`, `Date` | spool length; date of the end |
+
+* **Incremental**: continues from the last `SpoolEndTime` per spool tag already in the target (spools spanning midnight work), `MERGE` on `(PlantName, DepartmentName, SpoolTagId, SpoolEndTime)`, so reruns are idempotent. Telemetry is pruned by `Date` when every spool tag already has spools. Events older than the last known end are not picked up: run with `p_full_rebuild = True` (recompute and overwrite) after a historical (re)load or a correction.
+* **Layout**: unpartitioned, `OPTIMIZE ... ZORDER BY (PlantName, DepartmentName, SpoolTagId)`.
+* **Spool characteristics**: range join, filtered to the spool's own sensors:
+  ```sql
+  SELECT s.SpoolKey, t.TagId, AVG(t.Value), MIN(t.Value), MAX(t.Value), COUNT(*)
+  FROM   silver.SPOOL s
+  JOIN   silver.TAGLOG t
+    ON   t.PlantName = s.PlantName AND t.DepartmentName = s.DepartmentName
+   AND   t.Time > s.SpoolStartTime AND t.Time <= s.SpoolEndTime
+   AND   t.Date BETWEEN to_date(s.SpoolStartTime) AND s.Date   -- lets clustering skip files
+  WHERE  t.TagId IN (<the position's tags>)
+  GROUP BY s.SpoolKey, t.TagId
+  ```
+  Materialise this per completed spool into Gold (`fct_spool_tag_stats`) for reporting.
+* **Parameters**:
+  ```python
+  p_taglog_table          = "silver.TAGLOG"
+  p_tags_table            = "silver.TAGS"
+  p_target_table          = "silver.SPOOL"
+  p_spool_tag_description = "LASTSpoolPV"
+  p_plant_column          = "PlantName"
+  p_department_column     = "DepartmentName"
+  p_id_column             = "TagId"
+  p_time_column           = "Time"
+  p_value_column          = "Value"
+  p_description_column    = "Description"
+  p_full_rebuild          = False
+  p_dry_run               = False
+  ```
+* **Open**: which telemetry tags belong to each spool position (for the `IN (...)` above) is not modelled yet.
+
+---
+
 ## 4. Parameterized & Decoupled Execution Pattern
 
 * **No Static Config Files**: Configuration is metadata-driven via the upstream Control Layer.
@@ -212,6 +262,8 @@ The notebooks take full locations instead of building them, so they can be reuse
 | `p_plant_column`, `p_department_column` | all | Names of the plant / department columns already in the source (default `PlantName` / `DepartmentName`); clustering keys (1, 2), merge and Z-Order keys (3) |
 | `p_id_column` | all | Clustering key (1, 2) / business key (3) |
 | `p_time_column` | 1, 2 | Event timestamp column (UTC), default `Time` |
+
+Column names are matched case-insensitively, as Spark does (`TagId` finds a source `TagID`), and the notebooks then use the source's own spelling.
 
 `p_target_table` and the column names are validated as identifiers (`^[A-Za-z_][A-Za-z0-9_]*$` per part) before anything runs, since they are interpolated into SQL. Plant / department values read from the data are escaped as SQL literals. `p_source_path` is only checked for being non-empty.
 

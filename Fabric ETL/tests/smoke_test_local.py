@@ -122,4 +122,39 @@ for bad in [dict(p_target_table="silver.TAGS; DROP TABLE x"), dict(p_source_path
     try:
         run("nb_metadata_sync", **{**meta, **bad}); raise SystemExit(f"validation failed for {bad}")
     except ValueError as e: print("rejected:", e)
+# spool boundaries: TagID spelled differently from the p_id_column default, TagId 10 reused in PlantB
+spark.createDataFrame([("PlantA", "Winding", 10, "LASTSpoolPV"), ("PlantA", "Winding", 11, " lastspoolpv "),
+                       ("PlantA", "Winding", 12, "Speed"), ("PlantB", "Winding", 10, "Speed")],
+                      ["PlantName", "DepartmentName", "TagID", "Description"]).write.format("delta").saveAsTable("silver.SP_TAGS")
+sp_cols = ["PlantName", "DepartmentName", "TagID", "Time", "Value", "Date"]
+def sp_rows(rows):
+    return spark.createDataFrame([(p, d, t, T(ts), v) for p, d, t, ts, v in rows], sp_cols[:-1]).withColumn("Date", F.to_date("Time"))
+from pyspark.sql import functions as F
+sp_rows([("PlantA", "Winding", 10, "2026-10-01 01:00:00", 1.0), ("PlantA", "Winding", 10, "2026-10-01 05:00:00", 2.0),
+         ("PlantA", "Winding", 10, "2026-10-01 23:30:00", 3.0), ("PlantA", "Winding", 11, "2026-10-01 02:00:00", 7.0),
+         ("PlantA", "Winding", 12, "2026-10-01 03:00:00", 50.0), ("PlantA", "Winding", 12, "2026-10-01 04:00:00", 60.0),
+         ("PlantB", "Winding", 10, "2026-10-01 03:00:00", 99.0)]).write.format("delta").saveAsTable("silver.SP_TAGLOG")
+spool = dict(p_taglog_table="silver.SP_TAGLOG", p_tags_table="silver.SP_TAGS", p_target_table="silver.SPOOL")
+r = run("nb_spool_boundaries", **spool); print(r)
+assert r["spool_tags"] == 2 and r["spools_written"] == 4, r
+# day 2: tag 10's next spool spans midnight
+sp_rows([("PlantA", "Winding", 10, "2026-10-02 02:00:00", 4.0), ("PlantA", "Winding", 11, "2026-10-02 06:00:00", 8.0)]
+        ).write.format("delta").mode("append").saveAsTable("silver.SP_TAGLOG")
+r = run("nb_spool_boundaries", **spool); assert r["spools_written"] == 2, r
+r = run("nb_spool_boundaries", **spool); assert r["status"] == "NO_DATA", r
+sp = {(x.SpoolTagId, str(x.SpoolEndTime)): (str(x.SpoolStartTime), x.DurationSec, x.LastSpoolPV)
+      for x in spark.table("silver.SPOOL").collect()}
+assert len(sp) == 6 and all(k[0] in (10, 11) for k in sp), sp
+assert sp[(10, "2026-10-02 02:00:00")] == ("2026-10-01 23:30:00", 9000.0, 4.0), sp
+assert sp[(10, "2026-10-01 01:00:00")][0] == "None" and sp[(11, "2026-10-02 06:00:00")][0] == "2026-10-01 02:00:00", sp
+before = sorted(map(str, spark.table("silver.SPOOL").collect()))
+r = run("nb_spool_boundaries", **spool, p_full_rebuild=True); assert r["spools_written"] == 6, r
+assert sorted(map(str, spark.table("silver.SPOOL").collect())) == before
+# spool characteristics: Speed readings inside spool (01:00, 05:00] of tag 10
+n = spark.sql("""SELECT COUNT(*) FROM silver.SPOOL s JOIN silver.SP_TAGLOG t
+                 ON t.PlantName = s.PlantName AND t.DepartmentName = s.DepartmentName
+                AND t.Time > s.SpoolStartTime AND t.Time <= s.SpoolEndTime
+                WHERE s.SpoolTagId = 10 AND s.SpoolEndTime = '2026-10-01 05:00:00' AND t.TagID = 12""").first()[0]
+assert n == 2, n
+
 print("ALL OK")
