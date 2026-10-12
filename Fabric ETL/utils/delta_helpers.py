@@ -30,13 +30,6 @@ from datetime import date, datetime
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-# Silver telemetry tables are partitioned by these columns, in this order (CLAUDE.md 3.1 / 3.2).
-TELEMETRY_PARTITION_COLUMNS = ["plantname", "Year", "Month", "Date"]
-
-# Columns injected by the ETL to identify the source lane.
-PLANT_COLUMN = "plantname"
-DEPARTMENT_COLUMN = "departmentname"
-
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -52,16 +45,6 @@ def validate_identifier(value: str, name: str) -> str:
     """
     if not isinstance(value, str) or not _IDENTIFIER_RE.match(value):
         raise ValueError(f"Parameter {name}={value!r} is not a valid identifier")
-    return value
-
-
-def validate_label(value: str, name: str) -> str:
-    """Plant / department names are written as column values and predicate literals.
-
-    Allows spaces and `-`, rejects quotes, slashes and glob characters.
-    """
-    if not isinstance(value, str) or not value.strip() or re.search(r"[/\\'\"*?\[\]{}]", value):
-        raise ValueError(f"Parameter {name}={value!r} is not a valid label")
     return value
 
 
@@ -91,6 +74,8 @@ def to_bool(value) -> bool:
 
 def sql_literal(value) -> str:
     """Render a Python value as a Spark SQL literal for predicates."""
+    if value is None:
+        return "NULL"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
@@ -103,14 +88,6 @@ def sql_literal(value) -> str:
 # ---------------------------------------------------------------------------
 # Transformations
 # ---------------------------------------------------------------------------
-
-def add_source_columns(df: DataFrame, plant: str, department: str) -> DataFrame:
-    """Inject the lane identifiers `plantname` / `departmentname`."""
-    return (
-        df.withColumn(PLANT_COLUMN, F.lit(plant))
-          .withColumn(DEPARTMENT_COLUMN, F.lit(department))
-    )
-
 
 def add_time_partitions(df: DataFrame, time_column: str = "Time") -> DataFrame:
     """Derive `Year`, `Month`, `Date` strictly from the event time column.
@@ -127,6 +104,11 @@ def add_time_partitions(df: DataFrame, time_column: str = "Time") -> DataFrame:
           .withColumn("Month", F.month(ts))
           .withColumn("Date", F.to_date(ts))
     )
+
+
+def telemetry_partition_columns(plant_column: str):
+    """Silver telemetry tables are partitioned by plant, then Year / Month / Date (CLAUDE.md 3.1 / 3.2)."""
+    return [plant_column, "Year", "Month", "Date"]
 
 
 def require_columns(df: DataFrame, columns, context: str) -> None:
@@ -153,7 +135,7 @@ def write_partitioned_slice(
 
     With `replace_predicate`, the write atomically replaces exactly the rows matching the
     predicate (Delta `replaceWhere`) instead of blindly appending. The rest of the table is
-    untouched, so it still behaves as an append for every other plant/department/day, but a
+    untouched, so it still behaves as an append for every other slice, but a
     re-run of the same slice no longer duplicates rows.
     """
     spark = df.sparkSession

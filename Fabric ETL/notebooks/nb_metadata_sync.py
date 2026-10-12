@@ -19,7 +19,7 @@
 # |---|---|
 # | **Source** | `p_source_path`: full path, e.g. `Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet` (daily full snapshot) |
 # | **Target** | `p_target_table` |
-# | **Write** | Delta `MERGE` on `(plantname, departmentname, <p_id_column>)`: update matched, insert new |
+# | **Write** | Delta `MERGE` on `(<p_plant_column>, <p_department_column>, <p_id_column>)`: update matched, insert new |
 #
 # Tags that disappear from the snapshot are left as they are (retirement handling is a future
 # evolution, see `CLAUDE.md` section 5.2).
@@ -30,8 +30,8 @@
 
 p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
 p_target_table   = "silver.TAGS"
-p_plant          = "PlantA"
-p_department     = "Boiler"
+p_plant_column      = "plantname"        # Plant column in the source (partition column)
+p_department_column = "departmentname"   # Department column in the source
 p_id_column      = "TagId"
 p_dry_run        = False
 
@@ -49,12 +49,12 @@ spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 source_path  = validate_source_path(p_source_path)
 target_table = validate_table_name(p_target_table)
-plant        = validate_label(p_plant, "p_plant")
-department   = validate_label(p_department, "p_department")
+plant_column = validate_identifier(p_plant_column, "p_plant_column")
+dept_column  = validate_identifier(p_department_column, "p_department_column")
 id_column    = validate_identifier(p_id_column, "p_id_column")
 dry_run      = to_bool(p_dry_run)
 
-key_columns = [PLANT_COLUMN, DEPARTMENT_COLUMN, id_column]
+key_columns = [plant_column, dept_column, id_column]
 
 run_started = datetime.now(timezone.utc)
 print(f"Source : {source_path}")
@@ -66,9 +66,9 @@ print(f"Dry run: {dry_run}")
 
 # Read & stage the snapshot
 raw_df = spark.read.parquet(source_path)
-require_columns(raw_df, [id_column], "metadata snapshot")
+require_columns(raw_df, key_columns, "metadata snapshot")
 
-staged = add_source_columns(raw_df, plant, department)
+staged = raw_df
 rows_read = staged.count()
 
 # Rows without a business key can never be matched and would be re-inserted every day.
@@ -107,8 +107,6 @@ staged.unpersist()
 notebook_exit({
     "notebook": "nb_metadata_sync",
     "status": status,
-    "plant": plant,
-    "department": department,
     "table": target_table,
     "source_path": source_path,
     "rows_read": rows_read,

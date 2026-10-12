@@ -66,7 +66,7 @@ Fabric ETL/
 * **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
 * **Transformation & Partitioning**:
-  * Derives `plantname = lit(p_plant)`, `departmentname = lit(p_department)`.
+  * `plantname` / `departmentname` come from the source files (column names in `p_plant_column` / `p_department_column`).
   * Derives `Year = year(col("Time"))`, `Month = month(col("Time"))`, `Date = to_date(col("Time"))`.
   * Appends partitioned by `(plantname, Year, Month, Date)`.
 * **Optimization**:
@@ -80,8 +80,8 @@ Fabric ETL/
   ```python
   p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet"
   p_target_table   = "silver.TAGLOG"
-  p_plant          = "PlantA"
-  p_department     = "Boiler"
+  p_plant_column      = "plantname"
+  p_department_column = "departmentname"
   p_id_column      = "TagId"
   p_time_column    = "Time"
   p_dry_run        = False
@@ -97,7 +97,7 @@ Fabric ETL/
 * **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
 * **Transformation & Partitioning**:
-  * Injects `plantname` and `departmentname`.
+  * `plantname` / `departmentname` come from the source files (column names in `p_plant_column` / `p_department_column`).
   * Derives `Year`, `Month`, `Date` strictly from column `Time`.
   * Appends partitioned by `(plantname, Year, Month, Date)`.
 * **Optimization**:
@@ -114,8 +114,8 @@ Fabric ETL/
   ```python
   p_source_path    = "Files/ilayer_SCADA/PlantA/Boiler/2026/10/11/TAGLOG/*.parquet"
   p_target_table   = "silver.TAGLOG"
-  p_plant          = "PlantA"
-  p_department     = "Boiler"
+  p_plant_column      = "plantname"
+  p_department_column = "departmentname"
   p_id_column      = "TagId"
   p_time_column    = "Time"
   p_dry_run        = False
@@ -146,8 +146,8 @@ Fabric ETL/
   ```python
   p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
   p_target_table   = "silver.TAGS"
-  p_plant          = "PlantA"
-  p_department     = "Boiler"
+  p_plant_column      = "plantname"
+  p_department_column = "departmentname"
   p_id_column      = "TagId"
   p_dry_run        = False
   ```
@@ -219,18 +219,19 @@ The notebooks take full locations instead of building them, so they can be reuse
 |---|---|---|
 | `p_source_path` | all | Full source path handed to `spark.read.parquet` as is; globs allowed (`*`, `{a,b}`) |
 | `p_target_table` | all | Target Delta table: `table`, `lakehouse.table` or `lakehouse.schema.table` |
-| `p_plant`, `p_department` | all | Values written to `plantname` / `departmentname` (partition and merge keys) |
+| `p_plant_column`, `p_department_column` | all | Names of the plant / department columns already in the source (default `plantname` / `departmentname`); plant is the partition column, both are merge keys |
 | `p_id_column` | all | Z-Order column (1, 2) / business key (3) |
 | `p_time_column` | 1, 2 | Event timestamp column (UTC), default `Time` |
 
 `p_target_table` and the column names are validated as identifiers (`^[A-Za-z_][A-Za-z0-9_]*$` per part), and plant/department may not contain quote, slash or glob characters, since they are interpolated into predicates. `p_source_path` is not interpreted by the notebooks.
 
 ### 7.3 Deviations from the section 3 spec
-1. **Notebook 1 OPTIMIZE scope.** Delta only accepts partition columns in `OPTIMIZE ... WHERE`, and `departmentname` is not a partition column, so the spec's predicate fails. The notebook scopes by `plantname` and the loaded `Date` range; `departmentname` is still clustered by the Z-Order.
-2. **Idempotent onboarding.** Notebook 1 appends through Delta `replaceWhere`, which atomically replaces only the slice being loaded (`plantname` + `departmentname` + loaded date range), so re-running an onboarding does not duplicate history. It also drops rows with a null `Time`, since they cannot be partitioned, and counts them in the exit payload. Notebook 2 is a plain append, as specified (see 7.4).
-3. **Z-Order scope from the data.** Notebook 2 takes no date parameter: it Z-Orders the `(Year, Month, Date)` partitions present in the loaded rows, which is the one day of the source path.
+1. **Notebook 1 OPTIMIZE scope.** Delta only accepts partition columns in `OPTIMIZE ... WHERE`, and `departmentname` is not a partition column, so the spec's predicate fails. The notebook scopes by the loaded plants and `Date` range; the department column is still clustered by the Z-Order.
+2. **Idempotent onboarding.** Notebook 1 appends through Delta `replaceWhere`, which atomically replaces only the slice being loaded (the plant/department combinations found in the data + loaded date range), so re-running an onboarding does not duplicate history. It also drops rows with a null `Time`, since they cannot be partitioned, and counts them in the exit payload. Notebook 2 is a plain append, as specified (see 7.4).
+3. **Z-Order scope from the data.** Notebook 2 takes no date or plant parameter: it Z-Orders the `(plant, Year, Month, Date)` partitions present in the loaded rows, which is the one day of the source path.
 4. **Metadata staging.** Notebook 3 drops rows with a null business key and de-duplicates on `(plantname, departmentname, <p_id_column>)` before the MERGE, because a MERGE fails when several source rows match one target row. Schema auto-merge is enabled so new snapshot columns flow through `UPDATE SET *` / `INSERT *`. The first run creates the table from the snapshot.
-5. **Schema evolution.** Telemetry writes use `mergeSchema = true`, so a new source column is added to the Silver table rather than failing the load.
+5. **Plant / department from the source.** The source files already carry the plant and department columns, so the notebooks inject nothing; they only take the column names. A source missing either column fails the run.
+6. **Schema evolution.** Telemetry writes use `mergeSchema = true`, so a new source column is added to the Silver table rather than failing the load.
 
 ### 7.4 Scheduling & reruns (Notebook 2)
 * The pipeline runs Notebook 2 from a daily **tumbling window**, formats the window start into the day's folder and passes only `p_source_path`.

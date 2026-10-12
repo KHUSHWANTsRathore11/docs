@@ -41,39 +41,47 @@ def write(path, rows, cols):
     shutil.move(f"{path}.dir/{f}", path); shutil.rmtree(path + ".dir")
 
 T = lambda s: datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-cols = ["TagId", "Time", "Value"]
-# historical: 2 days for PlantA/Boiler
-write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/2026/10/01/TAGLOG.parquet", [(1, T("2026-10-01 01:00:00"), 1.0), (2, T("2026-10-01 05:00:00"), 2.0)], cols)
-write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/2026/10/02/TAGLOG.parquet", [(1, T("2026-10-02 01:00:00"), 3.0), (None, None, 9.0)], cols)
+cols = ["plantname", "departmentname", "TagId", "Time", "Value"]
+# historical: 2 days for PlantA/Boiler (plant/department columns are in the source files)
+write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/2026/10/01/TAGLOG.parquet", [("PlantA", "Boiler", 1, T("2026-10-01 01:00:00"), 1.0), ("PlantA", "Boiler", 2, T("2026-10-01 05:00:00"), 2.0)], cols)
+write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/2026/10/02/TAGLOG.parquet", [("PlantA", "Boiler", 1, T("2026-10-02 01:00:00"), 3.0), ("PlantA", "Boiler", None, None, 9.0)], cols)
 # metadata snapshot at same level must NOT be picked by historical glob
-write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", [(1, "Temp", "C", 10.0), (2, "Press", "bar", 5.0), (2, "Press", "bar", 5.0), (None, "x", "y", 0.0)], ["TagId", "Description", "Unit", "LastValue"])
+tag_cols = ["plantname", "departmentname", "TagId", "Description", "Unit", "LastValue"]
+write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", [("PlantA", "Boiler", 1, "Temp", "C", 10.0), ("PlantA", "Boiler", 2, "Press", "bar", 5.0), ("PlantA", "Boiler", 2, "Press", "bar", 5.0), ("PlantA", "Boiler", None, "x", "y", 0.0)], tag_cols)
 
 hist = dict(p_source_path=f"{bronze}/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet", p_target_table="silver.TAGLOG")
 r = run("nb_telemetry_historical", **hist, p_dry_run="true"); print(r); assert r["status"] == "DRY_RUN"
 assert not spark.catalog.tableExists("silver.TAGLOG")
 r = run("nb_telemetry_historical", **hist); print(r)
-assert r["rows_written"] == 3 and r["rows_dropped_null_time"] == 1
+assert r["rows_written"] == 3 and r["rows_dropped_null_time"] == 1 and r["plant_departments"] == ["PlantA/Boiler"], r
 r = run("nb_telemetry_historical", **hist); assert spark.table("silver.TAGLOG").count() == 3, "historical rerun not idempotent"
-print(spark.sql("DESCRIBE DETAIL silver.TAGLOG").select("partitionColumns").collect())
+parts = spark.sql("DESCRIBE DETAIL silver.TAGLOG").select("partitionColumns").collect()[0][0]
+assert parts == ["plantname", "Year", "Month", "Date"], parts
 
 # incremental: one day per source path
-write(f"{bronze}/ilayer_SCADA/PlantA/Boiler/2026/10/03/TAGLOG/part1.parquet", [(1, T("2026-10-03 00:00:00"), 4.0), (2, T("2026-10-03 23:59:59"), 5.0)], cols)
-write(f"{bronze}/ilayer_SCADA/PlantA/Turbine/2026/10/03/TAGLOG/part1.parquet", [(7, T("2026-10-03 12:00:00"), 7.0)], cols)
-inc = lambda dept: dict(p_source_path=f"{bronze}/ilayer_SCADA/PlantA/{dept}/2026/10/03/TAGLOG/*.parquet", p_target_table="silver.TAGLOG", p_department=dept)
+write(f"{bronze}/ilayer_SCADA/PlantA/Boiler/2026/10/03/TAGLOG/part1.parquet", [("PlantA", "Boiler", 1, T("2026-10-03 00:00:00"), 4.0), ("PlantA", "Boiler", 2, T("2026-10-03 23:59:59"), 5.0)], cols)
+write(f"{bronze}/ilayer_SCADA/PlantA/Turbine/2026/10/03/TAGLOG/part1.parquet", [("PlantA", "Turbine", 7, T("2026-10-03 12:00:00"), 7.0)], cols)
+inc = lambda dept: dict(p_source_path=f"{bronze}/ilayer_SCADA/PlantA/{dept}/2026/10/03/TAGLOG/*.parquet", p_target_table="silver.TAGLOG")
 r = run("nb_telemetry_incremental", **inc("Boiler"), p_dry_run=True); assert r["status"] == "DRY_RUN", r
 assert spark.table("silver.TAGLOG").count() == 3
 r = run("nb_telemetry_incremental", **inc("Boiler")); print(r)
-assert r["days"] == ["2026-10-03"] and r["rows_written"] == 2, r
+assert r["partitions"] == ["PlantA/2026-10-03"] and r["rows_written"] == 2, r
 r = run("nb_telemetry_incremental", **inc("Turbine"))
 assert spark.table("silver.TAGLOG").count() == 6, spark.table("silver.TAGLOG").count()
+assert spark.table("silver.TAGLOG").where("departmentname = 'Turbine'").count() == 1
 spark.table("silver.TAGLOG").orderBy("Time").show()
 
-# reuse in another scenario: different folder layout, columns and target table
-write(f"{bronze}/other_source/events/2026-10-03.parquet", [("A", T("2026-10-03 08:00:00")), ("B", T("2026-10-03 09:00:00"))], ["EventCode", "EventTime"])
+# reuse in another scenario: different folder layout, column names and target table
+write(f"{bronze}/other_source/events/2026-10-03.parquet", [("SiteB", "Packing", "A", T("2026-10-03 08:00:00")), ("SiteB", "Packing", "B", T("2026-10-03 09:00:00"))], ["Site", "Line", "EventCode", "EventTime"])
 r = run("nb_telemetry_incremental", p_source_path=f"{bronze}/other_source/events/*.parquet", p_target_table="silver.EVENTS",
-        p_plant="PlantB", p_department="Packing", p_id_column="EventCode", p_time_column="EventTime")
-assert r["rows_written"] == 2, r
-assert spark.table("silver.EVENTS").count() == 2
+        p_plant_column="Site", p_department_column="Line", p_id_column="EventCode", p_time_column="EventTime")
+assert r["rows_written"] == 2 and r["partitions"] == ["SiteB/2026-10-03"], r
+assert spark.sql("DESCRIBE DETAIL silver.EVENTS").select("partitionColumns").collect()[0][0] == ["Site", "Year", "Month", "Date"]
+# a missing plant/department column fails clearly
+try:
+    run("nb_telemetry_incremental", p_source_path=f"{bronze}/other_source/events/*.parquet", p_target_table="silver.EVENTS",
+        p_id_column="EventCode", p_time_column="EventTime"); raise SystemExit("missing plant column accepted")
+except ValueError as e: print("rejected:", e)
 
 # target table validation
 from importlib.util import spec_from_file_location, module_from_spec
@@ -87,7 +95,7 @@ for v in ["", "a.b.c.d", "silver.TAGS; DROP TABLE x", "silver..TAGS"]:
 # metadata
 meta = dict(p_source_path=f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", p_target_table="silver.TAGS")
 r = run("nb_metadata_sync", **meta); print(r); assert r["rows_staged"] == 2
-write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", [(1, "Temp", "K", 11.0), (3, "Flow", "m3", 1.0)], ["TagId", "Description", "Unit", "LastValue"])
+write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", [("PlantA", "Boiler", 1, "Temp", "K", 11.0), ("PlantA", "Boiler", 3, "Flow", "m3", 1.0)], tag_cols)
 r = run("nb_metadata_sync", **meta); print(r)
 spark.table("silver.TAGS").orderBy("TagId").show()
 rows = {x.TagId: x.Unit for x in spark.table("silver.TAGS").collect()}

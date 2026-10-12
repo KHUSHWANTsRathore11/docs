@@ -18,9 +18,9 @@
 # | | |
 # |---|---|
 # | **Source** | `p_source_path`: full path, globs allowed, e.g. `Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet` |
-# | **Target** | `p_target_table` partitioned by `(plantname, Year, Month, Date)` |
+# | **Target** | `p_target_table` partitioned by `(<p_plant_column>, Year, Month, Date)` |
 # | **Write** | append (re-runs replace only the loaded plant/department/date range) |
-# | **Optimize** | `OPTIMIZE ... ZORDER BY (departmentname, <p_id_column>)` scoped to the loaded partitions |
+# | **Optimize** | `OPTIMIZE ... ZORDER BY (<p_department_column>, <p_id_column>)` scoped to the loaded partitions |
 #
 # The notebook builds no paths itself. Relative `Files/...` paths resolve against the default
 # lakehouse; `abfss://...` paths work with any lakehouse attached.
@@ -29,8 +29,8 @@
 
 p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet"
 p_target_table   = "silver.TAGLOG"
-p_plant          = "PlantA"
-p_department     = "Boiler"
+p_plant_column      = "plantname"        # Plant column in the source (partition column)
+p_department_column = "departmentname"   # Department column in the source
 p_id_column      = "TagId"
 p_time_column    = "Time"       # Event timestamp column (UTC)
 p_dry_run        = False
@@ -49,8 +49,8 @@ spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 source_path  = validate_source_path(p_source_path)
 target_table = validate_table_name(p_target_table)
-plant        = validate_label(p_plant, "p_plant")
-department   = validate_label(p_department, "p_department")
+plant_column = validate_identifier(p_plant_column, "p_plant_column")
+dept_column  = validate_identifier(p_department_column, "p_department_column")
 id_column    = validate_identifier(p_id_column, "p_id_column")
 time_column  = validate_identifier(p_time_column, "p_time_column")
 dry_run      = to_bool(p_dry_run)
@@ -64,9 +64,10 @@ print(f"Dry run: {dry_run}")
 
 # Read & transform
 raw_df = spark.read.parquet(source_path)
-require_columns(raw_df, [time_column, id_column], "source")
+require_columns(raw_df, [plant_column, dept_column, time_column, id_column], "source")
 
-df = add_time_partitions(add_source_columns(raw_df, plant, department), time_column)
+df = add_time_partitions(raw_df, time_column)
+partition_columns = telemetry_partition_columns(plant_column)
 
 # Rows without an event time cannot be partitioned; drop them and report the count.
 null_time_rows = df.filter(F.col(time_column).isNull()).count()
@@ -79,6 +80,11 @@ print(f"Rows to load        : {row_count}")
 print(f"Rows dropped (null {time_column}): {null_time_rows}")
 print(f"Date range          : {min_date} -> {max_date}")
 
+# Plant/department combinations in this load; a re-run replaces exactly these over the date range.
+lanes = [(r[0], r[1]) for r in df.select(plant_column, dept_column).distinct().collect()] if row_count else []
+plants = sorted({p for p, _ in lanes}, key=str)
+print(f"Plant/department    : {lanes}")
+
 # CELL ********************
 
 # Write & optimize
@@ -89,22 +95,20 @@ elif dry_run:
     df.show(10, truncate=False)
     status = "DRY_RUN"
 else:
-    # Replacing exactly this plant/department/date range makes a re-run of the onboarding
-    # idempotent instead of duplicating history. Other plants/departments are untouched.
-    replace_predicate = (
-        f"{PLANT_COLUMN} = {sql_literal(plant)}"
-        f" AND {DEPARTMENT_COLUMN} = {sql_literal(department)}"
-        f" AND Date >= {sql_literal(min_date)} AND Date <= {sql_literal(max_date)}"
+    # Replacing exactly these plant/department combinations over the loaded date range makes a
+    # re-run of the onboarding idempotent instead of duplicating history.
+    date_range = f"Date >= {sql_literal(min_date)} AND Date <= {sql_literal(max_date)}"
+    lane_predicate = " OR ".join(
+        f"({plant_column} <=> {sql_literal(p)} AND {dept_column} <=> {sql_literal(d)})" for p, d in lanes
     )
-    write_partitioned_slice(df, target_table, TELEMETRY_PARTITION_COLUMNS, replace_predicate)
+    replace_predicate = f"({lane_predicate}) AND {date_range}"
+    write_partitioned_slice(df, target_table, partition_columns, replace_predicate)
 
-    # OPTIMIZE WHERE only accepts partition columns, so the scope is the plant + loaded date
-    # range; departmentname is clustered by the Z-Order instead.
-    optimize_predicate = (
-        f"{PLANT_COLUMN} = {sql_literal(plant)}"
-        f" AND Date >= {sql_literal(min_date)} AND Date <= {sql_literal(max_date)}"
-    )
-    zorder_optimize(spark, target_table, optimize_predicate, [DEPARTMENT_COLUMN, id_column])
+    # OPTIMIZE WHERE only accepts partition columns, so the scope is the plants + loaded date
+    # range; the department column is clustered by the Z-Order instead.
+    plant_predicate = " OR ".join(f"{plant_column} <=> {sql_literal(p)}" for p in plants)
+    optimize_predicate = f"({plant_predicate}) AND {date_range}"
+    zorder_optimize(spark, target_table, optimize_predicate, [dept_column, id_column])
     status = "SUCCEEDED"
 
 # CELL ********************
@@ -112,8 +116,7 @@ else:
 notebook_exit({
     "notebook": "nb_telemetry_historical",
     "status": status,
-    "plant": plant,
-    "department": department,
+    "plant_departments": [f"{p}/{d}" for p, d in lanes],
     "table": target_table,
     "source_path": source_path,
     "rows_read": row_count + null_time_rows,
