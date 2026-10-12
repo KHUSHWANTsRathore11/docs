@@ -157,4 +157,40 @@ n = spark.sql("""SELECT COUNT(*) FROM silver.SPOOL s JOIN silver.SP_TAGLOG t
                 WHERE s.SpoolTagId = 10 AND s.SpoolEndTime = '2026-10-01 05:00:00' AND t.TagID = 12""").first()[0]
 assert n == 2, n
 
+# tag -> MI point -> group -> data source
+spark.createDataFrame([
+    ("PlantA", "Winding", 1, "M1.Speed"), ("PlantA", "Winding", 2, "M1.Tension"), ("PlantA", "Winding", 3, "M2.Temp"),
+    ("PlantA", "Winding", 4, "M3.Speed"), ("PlantA", "Winding", 5, "M4.Speed"), ("PlantA", "Winding", 6, None),
+    ("PlantA", "Winding", 7, "m5.speed"), ("PlantA", "Winding", 8, "R&D.Flow"), ("PlantA", "Winding", 9, "M6.Cdata"),
+], "PlantName string, DepartmentName string, TagID int, DBtag string").write.format("delta").saveAsTable("silver.MAP_TAGS")
+spark.createDataFrame([
+    (100, 10, "<Point><OpcPointName>M1.Speed</OpcPointName></Point>"),
+    (101, 10, "<p:Point xmlns:p='urn:x'><p:OpcPointName unit='rpm'> M1.Tension </p:OpcPointName></p:Point>"),
+    (102, 11, "<Point><OpcPointName>M2.Temp</OpcPointName></Point>"),
+    (103, 12, "<Point><OpcPointName>M2.Temp</OpcPointName></Point>"),          # duplicate -> fan-out
+    (104, 99, "<Point><OpcPointName>M3.Speed</OpcPointName></Point>"),         # group missing
+    (105, 13, "<Point><OpcPointName>M4.Speed</OpcPointName></Point>"),         # data source missing
+    (106, 10, "<Point><OpcPointName>M5.Speed</OpcPointName></Point>"),         # case differs from DBtag
+    (107, 10, "<Point><OpcPointName>R&amp;D.Flow</OpcPointName></Point>"),     # entity
+    (108, 10, "<Point><OpcPointName><![CDATA[M6.Cdata]]></OpcPointName></Point>"),  # CDATA: not supported
+    (109, 10, "<Point><OpcPointName>broken"),                                   # malformed
+], "ID int, POINTGroupID int, Parameter string").write.format("delta").saveAsTable("silver.MI_POINT")
+spark.createDataFrame([(10, 1), (11, 1), (12, 2), (13, 77)], "ID int, DatasourceID int").write.format("delta").saveAsTable("silver.MI_POINT_GROUP")
+spark.createDataFrame([(1, "OPC-A"), (2, "OPC-B")], "ID int, ConnectorID string").write.format("delta").saveAsTable("silver.MI_DATA_SOURCE")
+mp = dict(p_tags_table="silver.MAP_TAGS")
+r = run("nb_tag_datasource_map", **mp); print(r)
+assert r["tags"] == 9 and r["rows"] == 10 and r["tags_with_multiple_points"] == 1, r
+got = {(x.TagId, x.PointID): (x.Machine, x.Characteristic, x.ConnectorID, x.LineageStatus)
+       for x in spark.table("silver.TAG_DATASOURCE").collect()}
+assert got[(1, 100)] == ("M1", "Speed", "OPC-A", "MATCHED"), got
+assert got[(2, 101)] == ("M1", "Tension", "OPC-A", "MATCHED"), got          # namespace + attribute + spaces
+assert got[(3, 102)][2] == "OPC-A" and got[(3, 103)][2] == "OPC-B", got     # fan-out to two connectors
+assert got[(4, 104)][3] == "NO_POINT_GROUP" and got[(5, 105)][3] == "NO_DATA_SOURCE", got
+assert got[(6, None)][3] == "NO_DBTAG" and got[(7, None)][3] == "NO_POINT", got
+assert got[(8, 107)][3] == "MATCHED" and got[(9, None)][3] == "NO_POINT", got  # entity decoded; CDATA not
+assert r["lineage_status"] == {"MATCHED": 5, "NO_POINT": 2, "NO_DBTAG": 1, "NO_POINT_GROUP": 1, "NO_DATA_SOURCE": 1}, r
+assert spark.sql("SHOW VIEWS IN silver LIKE 'tag_datasource'").count() == 1
+r = run("nb_tag_datasource_map", **mp, p_target="silver.TAG_DATASOURCE_T", p_as_view=False)
+assert spark.table("silver.TAG_DATASOURCE_T").count() == 10, r
+
 print("ALL OK")

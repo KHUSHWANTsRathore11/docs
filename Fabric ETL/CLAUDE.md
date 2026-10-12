@@ -43,7 +43,7 @@ Source shortcuts are located under `Files/` in the Bronze Lakehouse:
 
 ## 3. Bronze to Silver ETL Pipelines (Modular Notebooks)
 
-To maintain strict separation of concerns, high maintainability, and clean pipeline debugging, the Bronze $\rightarrow$ Silver processing is implemented across **3 Modular Notebooks**, plus a Silver $\rightarrow$ Silver notebook for spool boundaries:
+To maintain strict separation of concerns, high maintainability, and clean pipeline debugging, the Bronze $\rightarrow$ Silver processing is implemented across **3 Modular Notebooks**, plus Silver $\rightarrow$ Silver notebooks for spool boundaries and tag lineage:
 
 ```
 Fabric ETL/
@@ -51,7 +51,8 @@ Fabric ETL/
 │   ├── nb_telemetry_historical.py   <-- [Notebook 1] One-time onboarding load
 │   ├── nb_telemetry_incremental.py  <-- [Notebook 2] Daily scheduled incremental [X-1, X)
 │   ├── nb_metadata_sync.py          <-- [Notebook 3] Daily SCD1 metadata/dimension sync
-│   └── nb_spool_boundaries.py       <-- [Notebook 4] Daily spool boundaries from LASTSpoolPV (Silver -> Silver)
+│   ├── nb_spool_boundaries.py       <-- [Notebook 4] Daily spool boundaries from LASTSpoolPV (Silver -> Silver)
+│   └── nb_tag_datasource_map.py     <-- [Notebook 5] Tag -> MI point -> group -> data source / connector view
 ├── utils/
 │   └── nb_lib_delta_helpers.py      <-- Shared logic (time columns, clustering, Z-Order, merge)
 └── tests/
@@ -189,6 +190,26 @@ Fabric ETL/
   p_dry_run               = False
   ```
 * **Open**: which telemetry tags belong to each spool position (for the `IN (...)` above) is not modelled yet.
+
+---
+
+### 3.5 Notebook 5: `nb_tag_datasource_map` (Tag → Data Source / Connector)
+
+* **Purpose**: map each tag to its MI point, point group, data source and connector, with a step-by-step analysis of every join.
+* **Join chain** (all LEFT joins from `TAGS`, so no tag is dropped):
+  ```
+  TAGS.DBTag                  = <OpcPointName> in MI_POINT.Parameter (XML) -> MI_POINT.ID, PointGroupID
+  MI_POINT.PointGroupID       = MI_POINT_GROUP.ID                          -> DataSourceID
+  MI_POINT_GROUP.DataSourceID = MI_DATA_SOURCE.ID                          -> ConnectorID
+  ```
+* **Output columns**: `PlantName, DepartmentName, TagId, DBTag, Machine, Characteristic, PointID, PointGroupID, DataSourceID, ConnectorID, LineageStatus`.
+  * `DBTag` (`Machine.Characteristic`) is matched in full, trimmed and case-sensitive; `Machine` / `Characteristic` are split at the first `.`.
+  * `LineageStatus` = `NO_DBTAG`, `NO_POINT`, `NO_POINT_GROUP`, `NO_DATA_SOURCE` or `MATCHED`: where the chain breaks.
+  * A DBTag matching several points yields one row per point (fan-out), reported by the analysis.
+* **XML**: `<OpcPointName>` is extracted with a regular expression, not an XML parser, so one malformed document yields NULL (reported) instead of failing the query. Handles a namespace prefix, attributes, surrounding whitespace and the five standard entities; CDATA is not supported.
+* **Analysis** (printed, steps 1–6): DBTag coverage and DBTags shared across plants/departments; XML extraction failures and duplicate `OpcPointName`s; unmatched DBTags with case/whitespace near-matches; fan-out tags; missing point groups and data sources; final counts by status and by connector.
+* **Output**: `p_as_view = True` (default) creates a persisted Spark view, visible to Spark only (not to the SQL analytics endpoint or Direct Lake); `False` writes a Delta table with the same query.
+* **Parameters**: table names (`p_tags_table`, `p_point_table`, `p_point_group_table`, `p_data_source_table`, `p_target`), every column name (defaults `DBTag`, `ID`, `PointGroupID`, `Parameter`, `DataSourceID`, `ConnectorID`), `p_xml_element = "OpcPointName"`, `p_as_view`, `p_dry_run` (analysis only).
 
 ---
 
