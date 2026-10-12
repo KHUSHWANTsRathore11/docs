@@ -66,22 +66,22 @@ Fabric ETL/
 * **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
 * **Transformation & Partitioning**:
-  * `plantname` / `departmentname` come from the source files (column names in `p_plant_column` / `p_department_column`).
+  * `PlantName` / `DepartmentName` come from the source files (column names in `p_plant_column` / `p_department_column`).
   * Derives `Year = year(col("Time"))`, `Month = month(col("Time"))`, `Date = to_date(col("Time"))`.
-  * Appends partitioned by `(plantname, Year, Month, Date)`.
+  * Appends partitioned by `(PlantName, Year, Month, Date)`.
 * **Optimization**:
   * Runs scoped Z-Order:
     ```sql
     OPTIMIZE <p_target_table>
-    WHERE plantname = '{p_plant}' AND departmentname = '{p_department}'
-    ZORDER BY (departmentname, <p_id_column>);
+    WHERE PlantName = '<plant>' AND DepartmentName = '<department>'
+    ZORDER BY (DepartmentName, <p_id_column>);
     ```
 * **Parameters**:
   ```python
   p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet"
   p_target_table   = "silver.TAGLOG"
-  p_plant_column      = "plantname"
-  p_department_column = "departmentname"
+  p_plant_column      = "PlantName"
+  p_department_column = "DepartmentName"
   p_id_column      = "TagId"
   p_time_column    = "Time"
   p_dry_run        = False
@@ -97,25 +97,25 @@ Fabric ETL/
 * **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
 * **Transformation & Partitioning**:
-  * `plantname` / `departmentname` come from the source files (column names in `p_plant_column` / `p_department_column`).
+  * `PlantName` / `DepartmentName` come from the source files (column names in `p_plant_column` / `p_department_column`).
   * Derives `Year`, `Month`, `Date` strictly from column `Time`.
-  * Appends partitioned by `(plantname, Year, Month, Date)`.
+  * Appends partitioned by `(PlantName, Year, Month, Date)`.
 * **Optimization**:
   * Runs partition-scoped Z-Order for the processed date:
     ```sql
     OPTIMIZE <p_target_table>
-    WHERE plantname = '{p_plant}' 
+    WHERE PlantName = '<plant>' 
       AND Year = {target_year} 
       AND Month = {target_month} 
       AND Date = '{target_date}'
-    ZORDER BY (departmentname, <p_id_column>);
+    ZORDER BY (DepartmentName, <p_id_column>);
     ```
 * **Parameters**:
   ```python
   p_source_path    = "Files/ilayer_SCADA/PlantA/Boiler/2026/10/11/TAGLOG/*.parquet"
   p_target_table   = "silver.TAGLOG"
-  p_plant_column      = "plantname"
-  p_department_column = "departmentname"
+  p_plant_column      = "PlantName"
+  p_department_column = "DepartmentName"
   p_id_column      = "TagId"
   p_time_column    = "Time"
   p_dry_run        = False
@@ -129,13 +129,13 @@ Fabric ETL/
 * **Source**: `p_source_path`, the full path of the daily full snapshot, e.g. `Files/rlayer_SCADA/{Plant}/{Department}/{TableName}.parquet`.
 * **Target**: `p_target_table`, e.g. `silver.TAGS`
 * **Implementation Strategy**: **SCD Type 1 (Delta `MERGE` on Primary Key)**.
-  * Natural/Business Key: `(plantname, departmentname, <p_id_column>)`.
+  * Natural/Business Key: `(PlantName, DepartmentName, <p_id_column>)`.
   * Merge Pattern:
     ```sql
     MERGE INTO <p_target_table> AS target
     USING staged_daily_metadata AS source
-    ON target.plantname = source.plantname 
-       AND target.departmentname = source.departmentname 
+    ON target.PlantName = source.PlantName 
+       AND target.DepartmentName = source.DepartmentName 
        AND target.<p_id_column> = source.<p_id_column>
     WHEN MATCHED THEN 
       UPDATE SET *
@@ -146,8 +146,8 @@ Fabric ETL/
   ```python
   p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
   p_target_table   = "silver.TAGS"
-  p_plant_column      = "plantname"
-  p_department_column = "departmentname"
+  p_plant_column      = "PlantName"
+  p_department_column = "DepartmentName"
   p_id_column      = "TagId"
   p_dry_run        = False
   ```
@@ -183,7 +183,7 @@ While starting with **SCD Type 1**, the following architectures have been evalua
   * **Result**: Point-in-time accuracy for unit/PLC changes without row bloat.
 
 * **Alternative 2: Partitioned Daily Snapshot (`silver.tags_daily_snapshot`)**:
-  * Append-only table partitioned by `(plantname, snapshot_date)`.
+  * Append-only table partitioned by `(PlantName, snapshot_date)`.
   * Zero merge overhead; Parquet dictionary encoding compresses repeating daily snapshots by >90%.
   * Historical comparisons and current state are queried via standard date filtering or SQL window functions (`LAG`).
 
@@ -219,25 +219,25 @@ The notebooks take full locations instead of building them, so they can be reuse
 |---|---|---|
 | `p_source_path` | all | Full source path handed to `spark.read.parquet` as is; globs allowed (`*`, `{a,b}`) |
 | `p_target_table` | all | Target Delta table: `table`, `lakehouse.table` or `lakehouse.schema.table` |
-| `p_plant_column`, `p_department_column` | all | Names of the plant / department columns already in the source (default `plantname` / `departmentname`); plant is the partition column, both are merge keys |
+| `p_plant_column`, `p_department_column` | all | Names of the plant / department columns already in the source (default `PlantName` / `DepartmentName`); plant is the partition column, both are merge keys |
 | `p_id_column` | all | Z-Order column (1, 2) / business key (3) |
 | `p_time_column` | 1, 2 | Event timestamp column (UTC), default `Time` |
 
 `p_target_table` and the column names are validated as identifiers (`^[A-Za-z_][A-Za-z0-9_]*$` per part), and plant/department may not contain quote, slash or glob characters, since they are interpolated into predicates. `p_source_path` is not interpreted by the notebooks.
 
 ### 7.3 Deviations from the section 3 spec
-1. **Notebook 1 OPTIMIZE scope.** Delta only accepts partition columns in `OPTIMIZE ... WHERE`, and `departmentname` is not a partition column, so the spec's predicate fails. The notebook scopes by the loaded plants and `Date` range; the department column is still clustered by the Z-Order.
+1. **Notebook 1 OPTIMIZE scope.** Delta only accepts partition columns in `OPTIMIZE ... WHERE`, and `DepartmentName` is not a partition column, so the spec's predicate fails. The notebook scopes by the loaded plants and `Date` range; the department column is still clustered by the Z-Order.
 2. **Idempotent onboarding.** Notebook 1 appends through Delta `replaceWhere`, which atomically replaces only the slice being loaded (the plant/department combinations found in the data + loaded date range), so re-running an onboarding does not duplicate history. It also drops rows with a null `Time`, since they cannot be partitioned, and counts them in the exit payload. Notebook 2 is a plain append, as specified (see 7.4).
 3. **Z-Order scope from the data.** Notebook 2 takes no date or plant parameter: it Z-Orders the `(plant, Year, Month, Date)` partitions present in the loaded rows, which is the one day of the source path.
-4. **Metadata staging.** Notebook 3 drops rows with a null business key and de-duplicates on `(plantname, departmentname, <p_id_column>)` before the MERGE, because a MERGE fails when several source rows match one target row. Schema auto-merge is enabled so new snapshot columns flow through `UPDATE SET *` / `INSERT *`. The first run creates the table from the snapshot.
+4. **Metadata staging.** Notebook 3 drops rows with a null business key and de-duplicates on `(PlantName, DepartmentName, <p_id_column>)` before the MERGE, because a MERGE fails when several source rows match one target row. Schema auto-merge is enabled so new snapshot columns flow through `UPDATE SET *` / `INSERT *`. The first run creates the table from the snapshot.
 5. **Plant / department from the source.** The source files already carry the plant and department columns, so the notebooks inject nothing; they only take the column names. A source missing either column fails the run.
 6. **Schema evolution.** Telemetry writes use `mergeSchema = true`, so a new source column is added to the Silver table rather than failing the load.
 
 ### 7.4 Scheduling & reruns (Notebook 2)
 * The pipeline runs Notebook 2 from a daily **tumbling window**, formats the window start into the day's folder and passes only `p_source_path`.
-* The notebook reads the path, derives `Year` / `Month` / `Date` from `Time`, appends partitioned by `(plantname, Year, Month, Date)` and Z-Orders that day's partition. A source with no rows ends as `NO_DATA`.
+* The notebook reads the path, derives `Year` / `Month` / `Date` from `Time`, appends partitioned by `(PlantName, Year, Month, Date)` and Z-Orders that day's partition. A source with no rows ends as `NO_DATA`.
 * **Reruns.** The append is atomic: a run that fails before or during the write leaves nothing behind and can simply be re-run. A run that fails *after* the append committed (i.e. during `OPTIMIZE`) has already loaded its data; re-running it appends the day a second time. Check the run's error before re-running, or re-run only the `OPTIMIZE`.
-* Keep trigger concurrency at 1 per target table (or per plant). Two writes into the same `(plantname, Year, Month, Date)` partition at once, such as two departments of one plant on the same day, can fail with a Delta concurrent-write conflict. The failed run can simply be re-run.
+* Keep trigger concurrency at 1 per target table (or per plant). Two writes into the same `(PlantName, Year, Month, Date)` partition at once, such as two departments of one plant on the same day, can fail with a Delta concurrent-write conflict. The failed run can simply be re-run.
 
 ### 7.5 Decisions still pending (section 6)
 * `Date` is written as a `DATE` (`yyyy-MM-dd`); changing it touches only `add_time_partitions`.

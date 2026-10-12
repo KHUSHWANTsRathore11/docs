@@ -29,8 +29,8 @@
 
 p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet"
 p_target_table   = "silver.TAGLOG"
-p_plant_column      = "plantname"        # Plant column in the source (partition column)
-p_department_column = "departmentname"   # Department column in the source
+p_plant_column      = "PlantName"        # Plant column in the source (partition column)
+p_department_column = "DepartmentName"   # Department column in the source
 p_id_column      = "TagId"
 p_time_column    = "Time"       # Event timestamp column (UTC)
 p_dry_run        = False

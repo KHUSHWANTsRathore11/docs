@@ -41,12 +41,12 @@ def write(path, rows, cols):
     shutil.move(f"{path}.dir/{f}", path); shutil.rmtree(path + ".dir")
 
 T = lambda s: datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-cols = ["plantname", "departmentname", "TagId", "Time", "Value"]
+cols = ["PlantName", "DepartmentName", "TagId", "Time", "Value"]
 # historical: 2 days for PlantA/Boiler (plant/department columns are in the source files)
 write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/2026/10/01/TAGLOG.parquet", [("PlantA", "Boiler", 1, T("2026-10-01 01:00:00"), 1.0), ("PlantA", "Boiler", 2, T("2026-10-01 05:00:00"), 2.0)], cols)
 write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/2026/10/02/TAGLOG.parquet", [("PlantA", "Boiler", 1, T("2026-10-02 01:00:00"), 3.0), ("PlantA", "Boiler", None, None, 9.0)], cols)
 # metadata snapshot at same level must NOT be picked by historical glob
-tag_cols = ["plantname", "departmentname", "TagId", "Description", "Unit", "LastValue"]
+tag_cols = ["PlantName", "DepartmentName", "TagId", "Description", "Unit", "LastValue"]
 write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", [("PlantA", "Boiler", 1, "Temp", "C", 10.0), ("PlantA", "Boiler", 2, "Press", "bar", 5.0), ("PlantA", "Boiler", 2, "Press", "bar", 5.0), ("PlantA", "Boiler", None, "x", "y", 0.0)], tag_cols)
 
 hist = dict(p_source_path=f"{bronze}/rlayer_SCADA/PlantA/Boiler/*/*/*/TAGLOG.parquet", p_target_table="silver.TAGLOG")
@@ -56,7 +56,7 @@ r = run("nb_telemetry_historical", **hist); print(r)
 assert r["rows_written"] == 3 and r["rows_dropped_null_time"] == 1 and r["plant_departments"] == ["PlantA/Boiler"], r
 r = run("nb_telemetry_historical", **hist); assert spark.table("silver.TAGLOG").count() == 3, "historical rerun not idempotent"
 parts = spark.sql("DESCRIBE DETAIL silver.TAGLOG").select("partitionColumns").collect()[0][0]
-assert parts == ["plantname", "Year", "Month", "Date"], parts
+assert parts == ["PlantName", "Year", "Month", "Date"], parts
 
 # incremental: one day per source path
 write(f"{bronze}/ilayer_SCADA/PlantA/Boiler/2026/10/03/TAGLOG/part1.parquet", [("PlantA", "Boiler", 1, T("2026-10-03 00:00:00"), 4.0), ("PlantA", "Boiler", 2, T("2026-10-03 23:59:59"), 5.0)], cols)
@@ -68,7 +68,7 @@ r = run("nb_telemetry_incremental", **inc("Boiler")); print(r)
 assert r["partitions"] == ["PlantA/2026-10-03"] and r["rows_written"] == 2, r
 r = run("nb_telemetry_incremental", **inc("Turbine"))
 assert spark.table("silver.TAGLOG").count() == 6, spark.table("silver.TAGLOG").count()
-assert spark.table("silver.TAGLOG").where("departmentname = 'Turbine'").count() == 1
+assert spark.table("silver.TAGLOG").where("DepartmentName = 'Turbine'").count() == 1
 spark.table("silver.TAGLOG").orderBy("Time").show()
 
 # reuse in another scenario: different folder layout, column names and target table
