@@ -108,7 +108,7 @@ def resolve_execution_date(p_execution_date: str) -> date:
     """Resolve the data day X-1 that the run loads.
 
     Accepts:
-    * ""                       -> yesterday (UTC)
+    * ""                       -> None: the caller derives the day from the data
     * "YYYY-MM-DD"             -> that day
     * a window start timestamp -> its UTC day, e.g. a tumbling window's `windowStartTime`
       ("2026-10-11T00:00:00Z", "2026-10-11T00:00:00.0000000Z", "2026-10-11 02:00:00+02:00").
@@ -117,7 +117,7 @@ def resolve_execution_date(p_execution_date: str) -> date:
     """
     value = "" if p_execution_date is None else str(p_execution_date).strip()
     if value == "":
-        return datetime.now(timezone.utc).date() - timedelta(days=1)
+        return None
     if len(value) == 10:
         return datetime.strptime(value, "%Y-%m-%d").date()
 
@@ -137,6 +137,25 @@ def resolve_execution_date(p_execution_date: str) -> date:
             "00:00:00 UTC because the notebook loads one whole UTC day"
         )
     return ts.date()
+
+
+def single_date_in_data(df: DataFrame, date_column: str = "Date"):
+    """Return the one date present in `df` (ignoring nulls), or None if it has no rows.
+
+    Fails if the rows span several days: replacing every day found would let a stray row from
+    a neighbouring day overwrite that day's data, so the caller must name the day instead.
+    """
+    dates = [
+        r[0] for r in
+        df.select(date_column).where(F.col(date_column).isNotNull()).distinct().limit(11).collect()
+    ]
+    if len(dates) > 1:
+        shown = ", ".join(sorted(d.isoformat() for d in dates[:10])) + (", ..." if len(dates) > 10 else "")
+        raise ValueError(
+            f"Source rows span several days ({shown}). Pass p_execution_date to choose the day "
+            "to load; rows outside it are dropped."
+        )
+    return dates[0] if dates else None
 
 
 def utc_day_window(day: date):

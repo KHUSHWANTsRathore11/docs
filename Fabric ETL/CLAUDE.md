@@ -93,6 +93,7 @@ Fabric ETL/
 
 * **Purpose**: Scheduled daily run triggered at `X 00:00:00 UTC` to process telemetry from `[X-1 00:00:00 UTC, X 00:00:00 UTC)`.
 * **Source**: `p_source_path`, the full path built by the pipeline from the tumbling window start, e.g. `Files/ilayer_SCADA/{Plant}/{Department}/{Year}/{Month}/{Day}/{TableName}/*.parquet`.
+* **Day loaded**: taken from the data (`Time`) when `p_execution_date` is empty; all rows must fall on one UTC day, otherwise the run fails. Set `p_execution_date` to load one day from a source that mixes days.
 * **Target**: `p_target_table`, e.g. `silver.TAGLOG`
 * **Write Mode**: `.mode("append")`
 * **Transformation & Partitioning**:
@@ -117,7 +118,7 @@ Fabric ETL/
   p_department     = "Boiler"
   p_id_column      = "TagId"
   p_time_column    = "Time"
-  p_execution_date = ""      # "YYYY-MM-DD" or window start "YYYY-MM-DDT00:00:00Z" (Defaults to yesterday X-1 if empty)
+  p_execution_date = ""      # Optional: "YYYY-MM-DD" or window start "YYYY-MM-DDT00:00:00Z"; empty = day found in the data
   p_dry_run        = False
   ```
 
@@ -228,14 +229,15 @@ The notebooks take full locations instead of building them, so they can be reuse
 ### 7.3 Deviations from the section 3 spec
 1. **Notebook 1 OPTIMIZE scope.** Delta only accepts partition columns in `OPTIMIZE ... WHERE`, and `departmentname` is not a partition column, so the spec's predicate fails. The notebook scopes by `plantname` and the loaded `Date` range; `departmentname` is still clustered by the Z-Order.
 2. **Idempotent appends.** Plain `.mode("append")` duplicates rows on any re-run or backfill (section 6.4). Notebooks 1 and 2 append through Delta `replaceWhere`, which atomically replaces only the slice being loaded (`plantname` + `departmentname` + `Date` / date range) and leaves every other slice untouched. The first write creates the table partitioned by `(plantname, Year, Month, Date)`.
-3. **Window filter.** Notebook 2 keeps only rows with `Time` in `[X-1, X)` UTC; rows outside it (e.g. late chunks) are dropped and counted in the exit payload. Rows with a null `Time` are dropped in Notebook 1 for the same reason.
+3. **Window filter.** Notebook 2 keeps only rows with `Time` in the loaded UTC day; rows outside it (only possible when `p_execution_date` is set) are dropped and counted in the exit payload. Rows with a null `Time` are dropped in Notebook 1 for the same reason.
 4. **Metadata staging.** Notebook 3 drops rows with a null business key and de-duplicates on `(plantname, departmentname, <p_id_column>)` before the MERGE, because a MERGE fails when several source rows match one target row. Schema auto-merge is enabled so new snapshot columns flow through `UPDATE SET *` / `INSERT *`. The first run creates the table from the snapshot.
 5. **Schema evolution.** Telemetry writes use `mergeSchema = true`, so a new source column is added to the Silver table rather than failing the load.
 
 ### 7.4 Scheduling & reruns (Notebook 2)
-* The pipeline runs Notebook 2 from a daily **tumbling window**. It builds `p_source_path` for the window's day and passes the window start as `p_execution_date` (e.g. `@trigger().outputs.windowStartTime`).
-* The window start sets the `[start, start + 1 day)` filter and the Silver slice that is replaced; the source path does not need to match it exactly, since rows outside the window are dropped. It must be `00:00:00` UTC; any other value fails the run rather than loading a shifted window. Plain `YYYY-MM-DD` is still accepted for manual runs.
-* A failed window is recovered by re-running that window: the run replaces its own `plantname` + `departmentname` + `Date` slice, so reruns never duplicate rows and can be done one by one in any order.
+* The pipeline runs Notebook 2 from a daily **tumbling window**, formats the window start into the day's folder and passes only `p_source_path`.
+* With `p_execution_date` empty, the notebook reads the day from the rows' `Time`. Every row must fall on one UTC day; if they span several, the run fails and lists them rather than replacing more than one day. A source with no rows ends as `NO_DATA`.
+* `p_execution_date` (`YYYY-MM-DD`, or a window start that must be `00:00:00` UTC) pins the day instead: rows from other days are dropped. Use it for a source whose files mix days.
+* A failed window is recovered by re-running it: the run replaces its own `plantname` + `departmentname` + `Date` slice, so reruns never duplicate rows and can be done one by one in any order.
 * Keep trigger concurrency at 1 per target table (or per plant). Two writes into the same `(plantname, Year, Month, Date)` partition at once, such as two departments of one plant on the same day, can fail with a Delta concurrent-write conflict. The failed run can simply be re-run.
 
 ### 7.5 Decisions still pending (section 6)

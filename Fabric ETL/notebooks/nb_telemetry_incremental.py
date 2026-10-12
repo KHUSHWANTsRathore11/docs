@@ -12,7 +12,8 @@
 
 # # nb_telemetry_incremental — Daily Incremental (Notebook 2)
 #
-# Scheduled at `X 00:00:00 UTC`; loads telemetry for the window `[X-1 00:00:00 UTC, X 00:00:00 UTC)`.
+# Loads one UTC day of telemetry `[X-1 00:00:00 UTC, X 00:00:00 UTC)` and replaces that day's
+# plant/department slice in the target, so a failed run is recovered by simply re-running it.
 # Spec: `CLAUDE.md` section 3.2.
 #
 # | | |
@@ -22,11 +23,12 @@
 # | **Write** | append (a re-run for the same day replaces that plant/department/day slice) |
 # | **Optimize** | `OPTIMIZE ... WHERE plantname/Year/Month/Date ZORDER BY (departmentname, <p_id_column>)` |
 #
-# The caller builds `p_source_path` for the window (e.g. from the tumbling window start).
-# `p_execution_date` is the data day **X-1**, as `YYYY-MM-DD` or the window start timestamp
-# (must be 00:00:00 UTC). It drives the `[start, start + 1 day)` filter and the Silver slice that
-# is replaced, so re-running a failed window reloads exactly that day. Empty defaults to
-# yesterday (UTC) for manual runs.
+# The caller builds `p_source_path` for the day (e.g. from the tumbling window start).
+# Which day is loaded:
+# * `p_execution_date` empty (default): the day is read from the data. All rows must fall on
+#   one UTC day, otherwise the run fails and lists the days found.
+# * `p_execution_date` set (`YYYY-MM-DD`, or a window start at 00:00:00 UTC): that day is
+#   loaded and rows from other days are dropped. Use it when the source mixes days.
 #
 # Relative `Files/...` paths resolve against the default lakehouse; `abfss://...` paths work
 # with any lakehouse attached.
@@ -39,7 +41,7 @@ p_plant          = "PlantA"
 p_department     = "Boiler"
 p_id_column      = "TagId"
 p_time_column    = "Time"   # Event timestamp column (UTC)
-p_execution_date = ""       # "YYYY-MM-DD" or window start "YYYY-MM-DDT00:00:00Z" (Defaults to yesterday X-1 if empty)
+p_execution_date = ""       # Optional: "YYYY-MM-DD" or window start "YYYY-MM-DDT00:00:00Z"; empty = day found in the data
 p_dry_run        = False
 
 # CELL ********************
@@ -63,12 +65,12 @@ time_column  = validate_identifier(p_time_column, "p_time_column")
 dry_run      = to_bool(p_dry_run)
 
 target_date = resolve_execution_date(p_execution_date)
-window_start, window_end = utc_day_window(target_date)
+date_source = "parameter" if target_date else "data"
 
 run_started = datetime.now(timezone.utc)
 print(f"Source : {source_path}")
 print(f"Target : {target_table}")
-print(f"Window : [{window_start.isoformat()}Z, {window_end.isoformat()}Z)")
+print(f"Day    : {target_date or 'from data'}")
 print(f"Dry run: {dry_run}")
 
 # CELL ********************
@@ -79,23 +81,35 @@ require_columns(raw_df, [time_column, id_column], "source")
 
 df = add_time_partitions(add_source_columns(raw_df, plant, department), time_column)
 
-# Keep strictly the [X-1, X) window: the source can carry rows from neighbouring days (or be a
-# wider glob), and every written row must belong to the replaced Date partition.
-# Bounds are cast from strings so they are interpreted in the UTC session time zone,
-# independent of the driver's local time zone.
-start_ts = F.lit(window_start.strftime("%Y-%m-%d %H:%M:%S")).cast("timestamp")
-end_ts = F.lit(window_end.strftime("%Y-%m-%d %H:%M:%S")).cast("timestamp")
-in_window = (F.col(time_column) >= start_ts) & (F.col(time_column) < end_ts)
-df = df.withColumn("_in_window", F.coalesce(in_window, F.lit(False))).cache()
+if target_date is None:
+    target_date = single_date_in_data(df)
 
-counts = df.groupBy("_in_window").count().collect()
-rows_in_window = next((r["count"] for r in counts if r["_in_window"]), 0)
-rows_out_of_window = next((r["count"] for r in counts if not r["_in_window"]), 0)
+marked_df = None
 
-df = df.filter("_in_window").drop("_in_window")
+if target_date is None:
+    window_start = window_end = None
+    rows_in_window, rows_out_of_window = 0, df.count()
+else:
+    window_start, window_end = utc_day_window(target_date)
+    print(f"Window : [{window_start.isoformat()}Z, {window_end.isoformat()}Z) ({date_source})")
+
+    # Keep strictly the [X-1, X) window: the source can carry rows from neighbouring days (or be a
+    # wider glob), and every written row must belong to the replaced Date partition.
+    # Bounds are cast from strings so they are interpreted in the UTC session time zone,
+    # independent of the driver's local time zone.
+    start_ts = F.lit(window_start.strftime("%Y-%m-%d %H:%M:%S")).cast("timestamp")
+    end_ts = F.lit(window_end.strftime("%Y-%m-%d %H:%M:%S")).cast("timestamp")
+    in_window = (F.col(time_column) >= start_ts) & (F.col(time_column) < end_ts)
+    marked_df = df.withColumn("_in_window", F.coalesce(in_window, F.lit(False))).cache()
+
+    counts = marked_df.groupBy("_in_window").count().collect()
+    rows_in_window = next((r["count"] for r in counts if r["_in_window"]), 0)
+    rows_out_of_window = next((r["count"] for r in counts if not r["_in_window"]), 0)
+
+    df = marked_df.filter("_in_window").drop("_in_window")
 
 print(f"Rows in window      : {rows_in_window}")
-print(f"Rows outside window : {rows_out_of_window} (dropped)")
+print(f"Rows outside window : {rows_out_of_window} (dropped, incl. null {time_column})")
 
 # CELL ********************
 
@@ -125,7 +139,8 @@ else:
     zorder_optimize(spark, target_table, optimize_predicate, [DEPARTMENT_COLUMN, id_column])
     status = "SUCCEEDED"
 
-df.unpersist()
+if marked_df is not None:
+    marked_df.unpersist()
 
 # CELL ********************
 
@@ -137,6 +152,7 @@ notebook_exit({
     "table": target_table,
     "source_path": source_path,
     "execution_date": target_date,
+    "execution_date_source": date_source,
     "window_start_utc": window_start,
     "window_end_utc": window_end,
     "rows_read": rows_in_window + rows_out_of_window,

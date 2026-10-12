@@ -66,8 +66,16 @@ assert r["rows_written"] == 2 and r["rows_dropped_out_of_window"] == 1
 # Re-run of the same window, passed as a tumbling-window start timestamp
 r = run("nb_telemetry_incremental", **inc("Boiler"), p_execution_date="2026-10-03T00:00:00.0000000Z")
 assert r["execution_date"] == "2026-10-03" and r["rows_written"] == 2, r
-r = run("nb_telemetry_incremental", **inc("Turbine"), p_execution_date="2026-10-03")
+# Day taken from the data: only the path is passed
+r = run("nb_telemetry_incremental", **inc("Turbine"))
+assert r["execution_date"] == "2026-10-03" and r["execution_date_source"] == "data" and r["rows_written"] == 1, r
+r = run("nb_telemetry_incremental", **inc("Turbine"))
 assert spark.table("silver.TAGLOG").count() == 6, spark.table("silver.TAGLOG").count()
+# Without a date, a source spanning two days fails instead of guessing
+try:
+    run("nb_telemetry_incremental", **inc("Boiler")); raise SystemExit("multi-day source accepted")
+except ValueError as e: print("rejected:", e)
+assert spark.table("silver.TAGLOG").count() == 6
 spark.table("silver.TAGLOG").orderBy("Time").show()
 
 # reuse in another scenario: different folder layout, columns and target table
@@ -81,6 +89,7 @@ assert spark.table("silver.EVENTS").count() == 1
 from importlib.util import spec_from_file_location, module_from_spec
 spec = spec_from_file_location("delta_helpers", f"{ROOT}/utils/delta_helpers.py"); h = module_from_spec(spec); spec.loader.exec_module(h)
 from datetime import date
+assert h.resolve_execution_date("") is None
 for v in ["2026-10-03", "2026-10-03T00:00:00Z", "2026-10-03T00:00:00.0000000Z", "2026-10-03 00:00:00", "2026-10-03T02:00:00+02:00"]:
     assert h.resolve_execution_date(v) == date(2026, 10, 3), v
 for v in ["2026-10-03T01:00:00Z", "2026-10-03T00:00:00+02:00", "03/10/2026"]:
