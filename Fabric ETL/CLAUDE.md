@@ -223,7 +223,7 @@ The notebooks take full locations instead of building them, so they can be reuse
 | `p_id_column` | all | Z-Order column (1, 2) / business key (3) |
 | `p_time_column` | 1, 2 | Event timestamp column (UTC), default `Time` |
 
-`p_target_table` and the column names are validated as identifiers (`^[A-Za-z_][A-Za-z0-9_]*$` per part), and plant/department may not contain quote, slash or glob characters, since they are interpolated into predicates. `p_source_path` is not interpreted by the notebooks.
+`p_target_table` and the column names are validated as identifiers (`^[A-Za-z_][A-Za-z0-9_]*$` per part) before anything runs, since they are interpolated into SQL. Plant / department values read from the data are escaped as SQL literals. `p_source_path` is only checked for being non-empty.
 
 ### 7.3 Deviations from the section 3 spec
 1. **Notebook 1 OPTIMIZE scope.** Delta only accepts partition columns in `OPTIMIZE ... WHERE`, and `DepartmentName` is not a partition column, so the spec's predicate fails. The notebook scopes by the loaded plants and `Date` range; the department column is still clustered by the Z-Order.
