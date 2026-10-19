@@ -4,6 +4,16 @@ Column details for each source table. Columns are listed as provided. Notes are 
 
 ## SCADA
 
+### Bronze Shortcut Locations (confirmed)
+
+Shortcuts are under `Files/` in the Bronze lakehouse. Each plant and department has its own folder. Nothing is copied.
+
+| Source | Path pattern | Content | Load |
+| :--- | :--- | :--- | :--- |
+| Incremental telemetry | `Files/ilayer_SCADA/{Plant}/{Department}/{Year}/{Month}/{Day}/{TableName}/*.parquet` | Chunked intraday parquet files | Daily |
+| Historical telemetry | `Files/rlayer_SCADA/{Plant}/{Department}/{Year}/{Month}/{Day}/{TableName}.parquet` | One consolidated file per day | One-time onboarding |
+| Metadata (TAGS) | `Files/rlayer_SCADA/{Plant}/{Department}/{TableName}.parquet` | One file per table, daily full snapshot | Daily |
+
 ### TAGS
 
 | Column | Notes |
