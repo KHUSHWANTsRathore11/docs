@@ -62,7 +62,17 @@ MES `PlantName` and SCADA `PlantName` are **not always the same**. This must be 
 - Static plant name mapping (MES PlantName → SCADA PlantName).
 - List of departments, for the per-department join.
 - Whether `OPCpointName` can be empty, missing, or repeated across rows.
+- Which MES tables provide Machine, and the join path from MI_POINT to Machine (keys and columns).
+- Whether a tag can map to more than one machine or plant, and which result is wanted when it does.
+- Whether `TagId` is unique across plants. If not, the key must include plant.
+- Whether `TAGLOG.Time` is local plant time or UTC.
+- Whether `TAGLOG.Value` is only numeric or also holds text or booleans.
+- Whether `TAGLOG` is append-only, or readings can be corrected or deleted in SCADA.
+- Platform for the TAGS to MI_POINT join: SQL view or notebook step.
 - Purpose and definition of "spool" in this project.
+- Spool window logic, historical data.
+- Spool window logic, future data, including SCADA spool info when it becomes available.
+- How MES spool data is joined to the spool windows.
 - Framework layers, pipelines and target tables.
 - Keys, data types, and relationships between the tables.
 - Refresh frequency and data volume.
