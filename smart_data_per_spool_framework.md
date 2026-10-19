@@ -35,7 +35,7 @@ Smart Data per Spool is a Microsoft Fabric project. A framework for it is being 
 | Column | Notes |
 | :--- | :--- |
 | Id | |
-| PointGoupId | Spelling as provided. |
+| PointGroupId | |
 | Parameters | XML. The tag name is in the `<OPCpointName>` element. |
 | PlantName | MES plant name. |
 | ... | More columns, to be provided |
@@ -48,16 +48,16 @@ Smart Data per Spool is a Microsoft Fabric project. A framework for it is being 
 
 ### MES Join Chain (TAGS to Machine)
 
-Joins are listed in order. Spelling of table and column names is as provided and needs confirmation.
+Joins are listed in order.
 
 1. `TAGS.DbTag` = `MI_POINT.Parameters` → `<OPCpointName>` (one to one).
-2. `MI_POINT.PointGoupId` = `MI_POINT_GROUP.Id`.
+2. `MI_POINT.PointGroupId` = `MI_POINT_GROUP.Id`.
 3. `MI_POINT_GROUP.DataSourceId` = `MI_DATA_SOURCE.Id`.
 4. `MI_DATA_SOURCE.ConnectorId` = `MI_CONNECTOR.Id`.
 5. `MI_CONNECTOR.HostName` is the host name used for the next step.
-6. `Unit_Characterstic` is stored in rows, with one column per UnitId. Filter the rows where `Characterstic` = `"MiConnector"`, then match `Value_` to `MI_CONNECTOR.HostName`.
+6. `Unit_Characteristic` is stored in rows, with one column per UnitId. Filter the rows where `Characteristic` = `"MiConnector"`, then match `Value_` to `MI_CONNECTOR.HostName`.
 7. From the matched row, take `UnitId`.
-8. `Unit_Characterstic.UnitId` = `Resource_.UnitId` gives the machine.
+8. `Unit_Characteristic.UnitId` = `Resource_.UnitId` gives the machine.
 
 Machine comes from `Resource_` at step 8. The column that holds the machine name is to be provided.
 
@@ -77,11 +77,11 @@ MES `PlantName` and SCADA `PlantName` are **not always the same**. This must be 
 - Static plant name mapping (MES PlantName → SCADA PlantName).
 - List of departments, for the per-department join.
 - Whether `OPCpointName` can be empty, missing, or repeated across rows.
-- Columns of `MI_POINT_GROUP`, `MI_DATA_SOURCE`, `MI_CONNECTOR`, `Unit_Characterstic` and `Resource_`, beyond the join keys listed above.
-- Confirm spelling of `Unit_Characterstic`, `Characterstic`, `Value_` and `PointGoupId`.
+- Columns of `MI_POINT_GROUP`, `MI_DATA_SOURCE`, `MI_CONNECTOR`, `Unit_Characteristic` and `Resource_`, beyond the join keys listed above.
+- Confirm the spelling of `Value_`.
 - Which column in `Resource_` holds the machine name or ID.
-- Whether `Unit_Characterstic` has one row per (UnitId, Characterstic), and whether a `"MiConnector"` value can appear more than once.
-- Whether `MI_CONNECTOR.HostName` and `Unit_Characterstic.Value_` need trimming or case-insensitive matching.
+- Whether `Unit_Characteristic` has one row per (UnitId, Characteristic), and whether a `"MiConnector"` value can appear more than once.
+- Whether `MI_CONNECTOR.HostName` and `Unit_Characteristic.Value_` need trimming or case-insensitive matching.
 - Whether `MI_POINT` can have more than one row for the same `OPCpointName`.
 - Whether a tag can map to more than one machine or plant, and which result is wanted when it does.
 - Whether `TagId` is unique across plants. If not, the key must include plant.
