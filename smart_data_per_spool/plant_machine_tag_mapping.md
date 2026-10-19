@@ -27,14 +27,25 @@ Machine comes from `Resource_` at step 8. The column that holds the machine name
 
 MES `PlantName` and SCADA `PlantName` are **not always the same**. This must be handled in the logic.
 
-- For now, use a static mapping of MES plant name to SCADA plant name.
-- Later, the mapping may move to a config table or an Excel file. This is not decided.
-- The static mapping has not been provided yet.
+The mapping is derived from a CSV file, not typed by hand:
+
+- The CSV lists each SCADA `PlantName`, `DepartmentName` and server `hostname`. One SCADA plant has several hosts, one per department.
+- MES has one server per plant. `MI_CONNECTOR` is the link: `CSV.hostname` = `MI_CONNECTOR.HostName`, and from there the chain goes up to `MI_POINT.PlantName`.
+- The result is a mapping at grain `(SCADA PlantName, DepartmentName, hostname)` → MES `PlantName`. Several rows can map to the same MES plant.
+- This derived mapping is then used when joining SCADA tags to MES points.
+- A manual list is kept only as a fallback for hosts that do not match `MI_CONNECTOR`.
+
+Checks on the derived mapping:
+- CSV hostnames with no `MI_CONNECTOR` match.
+- A host that resolves to more than one MES plant.
+- A host with no points under its connector.
 
 ## To Be Provided
 
 - Sample `Parameters` XML from MI_POINT, to confirm the element path and any namespaces for `<OPCpointName>`.
-- Static plant name mapping (MES PlantName → SCADA PlantName).
+- The CSV file: its name, location, and exact columns (SCADA PlantName, DepartmentName, hostname).
+- Whether the CSV hostnames match `MI_CONNECTOR.HostName` exactly, or need trimming or case-insensitive matching.
+- Manual fallback mapping for hosts that do not match `MI_CONNECTOR`, if any.
 - List of departments, for the per-department join.
 - Whether `OPCpointName` can be empty, missing, or repeated across rows.
 - Whether `Unit_Characteristic` has one row per (UnitId, Characteristic), and whether a `"MiConnector"` value can appear more than once.
