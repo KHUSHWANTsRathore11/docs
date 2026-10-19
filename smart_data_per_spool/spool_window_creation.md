@@ -1,6 +1,6 @@
 # Spool Window Creation
 
-Part of the Smart Data per Spool framework. See `smart_data_per_spool_framework.md` for the source tables and the MES join chain.
+Part of the Smart Data per Spool project. See `README.md` for the overview, `table_details.md` for source tables, and `plant_machine_tag_mapping.md` for the MES join chain.
 
 This section covers building a table of spool windows. Two logics are planned. Details are to be provided.
 
