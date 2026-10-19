@@ -65,8 +65,8 @@ def view(name, schema, rows):
     spark.createDataFrame(rows, schema).createOrReplaceTempView(name)
 
 
-# SCADA host CSV: Press host differs in case / spacing from MI_CONNECTOR, PlantB has no points,
-# PlantC is not in MI_CONNECTOR, PlantD's connector feeds two MES plants
+# SCADA host CSV: Press host differs in case / spacing from MI_CONNECTOR, PlantB's connector has
+# no MES plant, PlantC is not in MI_CONNECTOR, PlantD's host is on two connectors with different MES plants
 csv_dir = tempfile.mkdtemp()
 csv_path = os.path.join(csv_dir, "scada_plant_hosts.csv")
 Path(csv_path).write_text(
@@ -78,8 +78,9 @@ Path(csv_path).write_text(
     "PlantD,Line,scada-d-line\n"
 )
 
-view("MI_CONNECTOR", "Id int, HostName string", [
-    (1, "scada-a-boiler"), (2, "scada-a-press "), (3, "scada-b-boiler"), (4, "scada-d-line"), (5, "orphan-host"),
+view("MI_CONNECTOR", "Id int, HostName string, PlantName string", [
+    (1, "scada-a-boiler", "MES_A"), (2, "scada-a-press ", "MES_A"), (3, "scada-b-boiler", None),
+    (4, "scada-d-line", "MES_D1"), (6, "SCADA-D-LINE", "MES_D2"), (5, "orphan-host", "MES_A"),
 ])
 view("MI_DATA_SOURCE", "Id int, ConnectorId int", [
     (10, 1), (20, 2), (30, 99), (40, 4), (50, 5),
@@ -135,11 +136,15 @@ assert result["mapping"] == [
     {"ScadaPlant": "PlantC", "Department": "Mill", "MesPlant": "MES_C", "Source": "MANUAL"},
 ], result["mapping"]
 assert result["unmatched"] == [{"ScadaPlant": "PlantB", "Department": "Boiler", "HostName": "scada-b-boiler",
-                                "Reason": "NO_POINTS_UNDER_CONNECTOR"}], result["unmatched"]
+                                "Reason": "NO_MES_PLANT_ON_CONNECTOR"}], result["unmatched"]
 assert [(a["ScadaPlant"], a["MesPlants"]) for a in result["ambiguous"]] == [("PlantD", ["MES_D1", "MES_D2"])]
 
 no_manual = json.loads(run_notebook("nb_scada_mes_plant_map", {"p_host_csv_path": csv_path}))
-assert {u["Reason"] for u in no_manual["unmatched"]} == {"NO_POINTS_UNDER_CONNECTOR", "HOST_NOT_IN_MI_CONNECTOR"}
+assert {u["Reason"] for u in no_manual["unmatched"]} == {"NO_MES_PLANT_ON_CONNECTOR", "HOST_NOT_IN_MI_CONNECTOR"}
+
+# Notebook 1 reads only the CSV and MI_CONNECTOR
+nb1 = (NOTEBOOKS / "nb_scada_mes_plant_map.py").read_text()
+assert not re.search(r"MI_POINT|MI_DATA_SOURCE|Unit_Characteristic|Resource_", nb1)
 
 # --- Notebook 2 (runs notebook 1) ----------------------------------------------------------------
 def run_and_capture(name, params):

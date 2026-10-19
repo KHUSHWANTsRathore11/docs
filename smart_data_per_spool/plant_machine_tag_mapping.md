@@ -41,7 +41,7 @@ MES `PlantName` and SCADA `PlantName` are **not always the same**. This must be 
 The mapping is derived from a CSV file, not typed by hand:
 
 - The CSV lists each SCADA `PlantName`, `DepartmentName` and server `hostname`. One SCADA plant has several hosts, one per department.
-- MES has one server per plant. `MI_CONNECTOR` is the link: `CSV.hostname` = `MI_CONNECTOR.HostName`, and from there the chain goes up to `MI_POINT.PlantName`.
+- MES has one server per plant. `MI_CONNECTOR` is the link: `CSV.hostname` = `MI_CONNECTOR.HostName`, and the MES plant is read from `MI_CONNECTOR` itself. Only the CSV and `MI_CONNECTOR` are used; no other MES table.
 - The result is a mapping at grain `(SCADA PlantName, DepartmentName, hostname)` → MES `PlantName`. Several rows can map to the same MES plant.
 - This derived mapping is then used when joining SCADA tags to MES points.
 - A manual list is kept only as a fallback for hosts that do not match `MI_CONNECTOR`.
@@ -49,14 +49,14 @@ The mapping is derived from a CSV file, not typed by hand:
 Checks on the derived mapping:
 - CSV hostnames with no `MI_CONNECTOR` match.
 - A host that resolves to more than one MES plant.
-- A host with no points under its connector.
+- A host whose `MI_CONNECTOR` row has no MES plant.
 
 ## Notebooks (Fabric Runtime 2.0)
 
 | Notebook | Purpose |
 | :--- | :--- |
-| `notebooks/nb_scada_mes_plant_map.py` | Derives the SCADA plant / department → MES plant mapping from the host CSV and `MI_CONNECTOR`. `p_manual_mapping_json` entries override or fill in. Writes nothing; exits with a JSON dict: `mapping` (list of `ScadaPlant`, `Department`, `MesPlant`, `Source`), `unmatched`, `ambiguous`. |
-| `notebooks/nb_plant_machine_tag_map.py` | Runs the first notebook, builds the MES chain from Silver, joins `scada_tags` plant-scoped, and prints the analysis. The final table write is commented out (print mode). |
+| `notebooks/nb_scada_mes_plant_map.py` | Derives the SCADA plant / department → MES plant mapping from the host CSV and `MI_CONNECTOR` only. `p_manual_mapping_json` entries override or fill in. Writes nothing; exits with a JSON dict: `mapping` (list of `ScadaPlant`, `Department`, `MesPlant`, `Source`), `unmatched`, `ambiguous`. |
+| `notebooks/nb_plant_machine_tag_map.py` | All other logic. Runs the first notebook, builds the MES chain from Silver, joins `scada_tags` plant-scoped, and prints the analysis. The final table write is commented out (print mode). |
 
 Matching rules used in the notebooks:
 
@@ -72,6 +72,8 @@ Parameter defaults that are placeholders until confirmed: the CSV path (`Files/c
 Local test: `tests/smoke_test_local.py` runs both notebooks on synthetic data with PySpark 4.0 (`pip install pyspark==4.0.1`, Java 17+).
 
 ## To Be Provided
+
+- Name of the MES plant column on `MI_CONNECTOR` (notebook default `PlantName`), and whether its values equal `MI_POINT.PlantName`, which notebook 2 joins on.
 
 - Sample `Parameters` XML from MI_POINT, to confirm the element path and any namespaces for `<OPCpointName>`.
 - The CSV file: its name, location, and exact columns (SCADA PlantName, DepartmentName, hostname).

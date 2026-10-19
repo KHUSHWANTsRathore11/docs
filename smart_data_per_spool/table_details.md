@@ -81,6 +81,7 @@ Shortcuts are under `Files/` in the Bronze lakehouse. Each plant and department 
 | :--- | :--- |
 | Id | |
 | HostName | |
+| *(MES plant)* | Column name to be provided. Used by the plant mapping. |
 | ... | More columns, to be provided |
 
 ### Unit_Characteristic

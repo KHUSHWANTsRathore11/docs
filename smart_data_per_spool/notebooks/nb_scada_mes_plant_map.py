@@ -12,13 +12,13 @@
 
 # # nb_scada_mes_plant_map — SCADA plant to MES plant mapping
 #
-# Derives which MES plant each SCADA plant / department belongs to.
+# Derives which MES plant each SCADA plant / department belongs to, from two inputs only.
 # Spec: `smart_data_per_spool/plant_machine_tag_mapping.md`, section "Plant Name Mapping".
 #
 # | | |
 # |---|---|
-# | **Inputs** | CSV of SCADA plant, department and server host name; Silver `MI_CONNECTOR`, `MI_DATA_SOURCE`, `MI_POINT_GROUP`, `MI_POINT` |
-# | **Logic** | CSV host name = `MI_CONNECTOR.HostName` (trimmed, case-insensitive) → data source → point group → point → `MI_POINT.PlantName` |
+# | **Inputs** | CSV of SCADA plant, department and server host name; Silver `MI_CONNECTOR` |
+# | **Logic** | CSV host name = `MI_CONNECTOR.HostName` (trimmed, case-insensitive) → MES plant on the connector |
 # | **Manual mapping** | `p_manual_mapping_json` entries replace the derived row for the same SCADA plant / department, or add a missing one |
 # | **Output** | Exit value: JSON dict with `mapping` = list of `{ScadaPlant, Department, MesPlant, Source}`, plus `unmatched` and `ambiguous` for review |
 #
@@ -33,19 +33,10 @@ p_csv_plant_column       = "PlantName"
 p_csv_department_column  = "DepartmentName"
 p_csv_hostname_column    = "HostName"
 
-# MES tables (Silver) and their columns
-p_point_table            = "MI_POINT"
-p_point_group_column     = "PointGroupId"
-p_point_plant_column     = "PlantName"
-p_point_group_table      = "MI_POINT_GROUP"
-p_point_group_id_column  = "Id"
-p_group_data_source_column = "DataSourceId"
-p_data_source_table      = "MI_DATA_SOURCE"
-p_data_source_id_column  = "Id"
-p_data_source_connector_column = "ConnectorId"
+# MI_CONNECTOR (Silver)
 p_connector_table        = "MI_CONNECTOR"
-p_connector_id_column    = "Id"
 p_connector_host_column  = "HostName"
+p_connector_plant_column = "PlantName"   # MES plant column on MI_CONNECTOR, to be confirmed
 
 # Manual entries, JSON list. Example:
 # '[{"ScadaPlant": "PlantA", "Department": "Boiler", "MesPlant": "PLANT_A"}]'
@@ -80,11 +71,12 @@ def parse_manual_mapping(text):
 
 manual_mapping = parse_manual_mapping(p_manual_mapping_json)
 print(f"Host CSV       : {p_host_csv_path}")
+print(f"Connector table: {p_connector_table}")
 print(f"Manual entries : {len(manual_mapping)}")
 
 # CELL ********************
 
-# SCADA side: plant / department / host from the CSV
+# CSV host → MI_CONNECTOR host → MES plant
 hosts = (
     spark.read.option("header", True).csv(p_host_csv_path)
     .select(
@@ -96,59 +88,35 @@ hosts = (
     .dropDuplicates()
     .withColumn("HostKey", host_key(F.col("HostName")))
 )
-
-# MES side: which MES plants sit under each connector host
-connectors = spark.table(p_connector_table).select(
-    F.col(p_connector_id_column).alias("ConnectorId"),
-    host_key(F.col(p_connector_host_column)).alias("HostKey"),
+connectors = (
+    spark.table(p_connector_table)
+    .select(
+        host_key(F.col(p_connector_host_column)).alias("HostKey"),
+        F.trim(F.col(p_connector_plant_column)).alias("MesPlant"),
+    )
+    .withColumn("InConnector", F.lit(True))
+    .dropDuplicates()
 )
-data_sources = spark.table(p_data_source_table).select(
-    F.col(p_data_source_id_column).alias("DataSourceId"),
-    F.col(p_data_source_connector_column).alias("ConnectorId"),
-)
-point_groups = spark.table(p_point_group_table).select(
-    F.col(p_point_group_id_column).alias("PointGroupId"),
-    F.col(p_group_data_source_column).alias("DataSourceId"),
-)
-points = spark.table(p_point_table).select(
-    F.col(p_point_group_column).alias("PointGroupId"),
-    F.trim(F.col(p_point_plant_column)).alias("MesPlant"),
-)
-
-host_mes_plants = (
-    connectors
-    .join(data_sources, "ConnectorId")
-    .join(point_groups, "DataSourceId")
-    .join(points, "PointGroupId")
-    .filter("MesPlant IS NOT NULL AND MesPlant <> ''")
-    .groupBy("HostKey", "MesPlant")
-    .agg(F.count(F.lit(1)).alias("Points"))
-)
-connector_hosts = connectors.select("HostKey").distinct().withColumn("InConnector", F.lit(True))
 
 host_rows = (
-    hosts
-    .join(connector_hosts, "HostKey", "left")
-    .join(host_mes_plants, "HostKey", "left")
-    .select("ScadaPlant", "Department", "HostName", "InConnector", "MesPlant", "Points")
+    hosts.join(connectors, "HostKey", "left")
+    .select("ScadaPlant", "Department", "HostName", "InConnector", "MesPlant")
     .orderBy("ScadaPlant", "Department", "HostName", "MesPlant")
     .collect()
 )
 
-print("Host → MES plant (one row per host and MES plant):")
+print("CSV host → MI_CONNECTOR MES plant:")
 spark.createDataFrame(host_rows, "ScadaPlant string, Department string, HostName string, "
-                      "InConnector boolean, MesPlant string, Points long").show(200, truncate=False)
+                      "InConnector boolean, MesPlant string").show(500, truncate=False)
 
 # CELL ********************
 
-# Resolve one MES plant per SCADA plant / department
+# One MES plant per SCADA plant / department
 by_key = {}
 for row in host_rows:
-    key = (row.ScadaPlant, row.Department)
-    entry = by_key.setdefault(key, {"hosts": {}, "mes_plants": set()})
-    host = entry["hosts"].setdefault(row.HostName, {"in_connector": bool(row.InConnector), "mes_plants": set()})
+    entry = by_key.setdefault((row.ScadaPlant, row.Department), {"hosts": {}, "mes_plants": set()})
+    entry["hosts"].setdefault(row.HostName, bool(row.InConnector))
     if row.MesPlant:
-        host["mes_plants"].add(row.MesPlant)
         entry["mes_plants"].add(row.MesPlant)
 
 derived, unmatched, ambiguous = {}, [], []
@@ -161,19 +129,18 @@ for (scada_plant, department), entry in sorted(by_key.items()):
             "Source": "DERIVED",
         }
     elif not entry["mes_plants"]:
-        for host_name, host in sorted(entry["hosts"].items()):
+        for host_name, in_connector in sorted(entry["hosts"].items()):
             unmatched.append({
                 "ScadaPlant": scada_plant,
                 "Department": department,
                 "HostName": host_name,
-                "Reason": "NO_POINTS_UNDER_CONNECTOR" if host["in_connector"] else "HOST_NOT_IN_MI_CONNECTOR",
+                "Reason": "NO_MES_PLANT_ON_CONNECTOR" if in_connector else "HOST_NOT_IN_MI_CONNECTOR",
             })
     else:
         ambiguous.append({
             "ScadaPlant": scada_plant,
             "Department": department,
             "MesPlants": sorted(entry["mes_plants"]),
-            "Hosts": {h: sorted(v["mes_plants"]) for h, v in sorted(entry["hosts"].items())},
         })
 
 # Manual entries win over derived ones and resolve unmatched / ambiguous keys
