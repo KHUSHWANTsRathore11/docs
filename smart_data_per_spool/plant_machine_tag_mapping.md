@@ -51,6 +51,26 @@ Checks on the derived mapping:
 - A host that resolves to more than one MES plant.
 - A host with no points under its connector.
 
+## Notebooks (Fabric Runtime 2.0)
+
+| Notebook | Purpose |
+| :--- | :--- |
+| `notebooks/nb_scada_mes_plant_map.py` | Derives the SCADA plant / department → MES plant mapping from the host CSV and `MI_CONNECTOR`. `p_manual_mapping_json` entries override or fill in. Writes nothing; exits with a JSON dict: `mapping` (list of `ScadaPlant`, `Department`, `MesPlant`, `Source`), `unmatched`, `ambiguous`. |
+| `notebooks/nb_plant_machine_tag_map.py` | Runs the first notebook, builds the MES chain from Silver, joins `scada_tags` plant-scoped, and prints the analysis. The final table write is commented out (print mode). |
+
+Matching rules used in the notebooks:
+
+- Host names: trimmed, case-insensitive (CSV ↔ `MI_CONNECTOR.HostName`, and `MI_CONNECTOR.HostName` ↔ `Unit_Characteristic.Value_`).
+- `Characteristic = "MiConnector"`: trimmed, case-insensitive.
+- `DbTag` ↔ `<OPCpointName>`: `DbTag` trimmed, case-sensitive. The XML element name is matched case-insensitively, with optional namespace prefix and attributes; CDATA and the five standard entities are handled. A malformed XML gives NULL, not a failure.
+- A SCADA plant / department whose hosts lead to more than one MES plant is **ambiguous** and is left out of the mapping until a manual entry resolves it.
+- All joins after the plant mapping are LEFT joins from `scada_tags`. `LineageStatus` is `NO_PLANT_MAPPING`, `NO_DBTAG`, `NO_POINT`, `NO_POINT_GROUP`, `NO_DATA_SOURCE`, `NO_CONNECTOR`, `NO_UNIT`, `NO_RESOURCE` or `MATCHED`.
+- `Resource_` columns are carried through with a `res_` prefix, since the machine column is not confirmed yet.
+
+Parameter defaults that are placeholders until confirmed: the CSV path (`Files/config/scada_plant_hosts.csv`) and its column names (`PlantName`, `DepartmentName`, `HostName`), and the MES table and column names as listed in `table_details.md`.
+
+Local test: `tests/smoke_test_local.py` runs both notebooks on synthetic data with PySpark 4.0 (`pip install pyspark==4.0.1`, Java 17+).
+
 ## To Be Provided
 
 - Sample `Parameters` XML from MI_POINT, to confirm the element path and any namespaces for `<OPCpointName>`.
@@ -63,4 +83,3 @@ Checks on the derived mapping:
 - Whether `MI_CONNECTOR.HostName` and `Unit_Characteristic.Value_` need trimming or case-insensitive matching.
 - Whether `MI_POINT` can have more than one row for the same `OPCpointName`.
 - Whether a tag can map to more than one machine or plant, and which result is wanted when it does.
-- Platform for the join: SQL view or notebook step.
