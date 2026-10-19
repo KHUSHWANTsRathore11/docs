@@ -4,6 +4,15 @@ Column details for each source table. Columns are listed as provided. Notes are 
 
 ## SCADA
 
+### Working Source (Silver)
+
+For now, the logic uses the consolidated Silver tables, built by hand from the Bronze shortcuts:
+
+- `scada_tags` (SCADA TAGS)
+- `scada_taglog` (SCADA TAGLOG)
+
+The MES tables are also available in Silver. The Bronze to Silver ETL for SCADA is out of scope for now and will be built later.
+
 ### Bronze Shortcut Locations (confirmed)
 
 Shortcuts are under `Files/` in the Bronze lakehouse. Each plant and department has its own folder. Nothing is copied.
