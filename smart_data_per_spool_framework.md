@@ -90,9 +90,7 @@ MES `PlantName` and SCADA `PlantName` are **not always the same**. This must be 
 - Whether `TAGLOG` is append-only, or readings can be corrected or deleted in SCADA.
 - Platform for the TAGS to MI_POINT join: SQL view or notebook step.
 - Purpose and definition of "spool" in this project.
-- Spool window logic, historical data.
-- Spool window logic, future data, including SCADA spool info when it becomes available.
-- How MES spool data is joined to the spool windows.
+- Spool window creation: see `spool_window_creation.md`.
 - Framework layers, pipelines and target tables.
 - Keys, data types, and relationships between the tables.
 - Refresh frequency and data volume.
