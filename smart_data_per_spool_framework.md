@@ -22,6 +22,40 @@ Out of scope for this draft:
 - Changes to the SCADA or plant systems.
 - Spool master data ownership (assumed to come from an existing ERP or fabrication system; see open questions).
 
+## Source Tables (SCADA)
+
+Two tables from the SCADA system feed the framework.
+
+**TAGS** (tag master, one row per tag)
+
+| Column | Use in framework |
+| :--- | :--- |
+| `TagId` | Source key. Basis for `tag_key` (see open questions). |
+| `PlantName` | Plant of the tag. Used for spool filtering and `plant_id`. |
+| `DepartmentName` | Department of the tag. Kept as a dimension attribute. |
+| `Location` | Used for spool linking (station or area where the tag sits). |
+| `Part` | Physical part the tag measures or controls. Candidate spool attribute. |
+| `Description` | Human-readable tag description. |
+| `DbTag` | Tag address in the SCADA database. Kept for traceability. |
+| *(other columns)* | Carried through to `dim_tag` unchanged for now. |
+
+**TAGLOG** (time-series readings, one row per reading)
+
+| Column | Use in framework |
+| :--- | :--- |
+| `TaglogId` | Source row ID. Kept for traceability and dedupe. |
+| `TagId` | Joins to TAGS. |
+| `Value` | Measured value. |
+| `Time` | Event time. Converted to `event_ts_utc` in silver. |
+| `PlantName` | Denormalized from TAGS. Checked against TAGS on load. |
+| `DepartmentName` | Denormalized from TAGS. Checked against TAGS on load. |
+
+Mapping into the medallion layers:
+
+- TAGS → `dim_tag` (silver), with `tag_key` built from plant, server and `TagId`.
+- TAGLOG → `fact_tag_event` (silver), MERGE key `(tag_key, event_ts_utc)`. `TaglogId` is kept as a column so the source row can be traced.
+- `TAGLOG.PlantName` and `DepartmentName` should match the TAGS row for that `TagId`. Mismatches go to `dq_result`.
+
 ## Architecture
 
 Reuses the medallion pattern already described in `tags`, extended with a spool layer.
@@ -46,8 +80,8 @@ Gold    (spool-level datasets)
 
 | Entity | Key | Notes |
 | :--- | :--- | :--- |
-| `dim_tag` (silver) | `tag_key` | Existing. `tag_key` = plant + server + tag name. |
-| `fact_tag_event` (silver) | `(tag_key, event_ts_utc)` | Existing MERGE key. |
+| `dim_tag` (silver) | `tag_key` | From SCADA `TAGS`. `tag_key` = plant + server + `TagId`. |
+| `fact_tag_event` (silver) | `(tag_key, event_ts_utc)` | From SCADA `TAGLOG`. Existing MERGE key. |
 | `dim_spool` (gold) | `spool_id` | **[Assumption]** Source: fabrication/ERP extract. |
 | `bridge_spool_tag_window` (gold) | `(spool_id, tag_key, window_start_utc)` | Links tag windows to spools. |
 | `spool_summary` (gold) | `spool_id` | Rebuilt or incrementally merged per run. |
@@ -58,7 +92,9 @@ Tag events are linked to a spool when all of the following hold:
 
 1. The tag belongs to the spool's plant (`plant_id` match).
 2. The event time falls inside the spool's active window (`start_ts_utc` to `end_ts_utc`).
-3. **[Assumption]** The tag is in the spool's location list (for example, a station or line). If location data is not available, use the time window only and mark the link `match_method = 'time_only'`.
+3. **[Assumption]** The tag's `TAGS.Location` is in the spool's location list (for example, a station or line). If location data is not available, use the time window only and mark the link `match_method = 'time_only'`.
+
+Rule 2 uses `TAGLOG.Time`, converted to `event_ts_utc`. The conversion depends on the timezone of `Time`, which is an open question.
 
 Each link stores `match_method` and `confidence` so consumers can filter weaker matches. A tag event may match more than one spool only if their windows overlap. The rule for that case is an open question.
 
@@ -109,6 +145,12 @@ Nothing is created yet beyond this document.
 5. What "smart" outputs are needed first: traceability, cost per spool, quality/defect history, or anomaly detection?
 6. Expected data volume and refresh frequency (batch or near real time)?
 7. Who owns the Fabric workspace and the gold layer?
+8. Is `TagId` unique across all plants, or only within one plant? If not, `tag_key` must include `PlantName`.
+9. What timezone is `TAGLOG.Time` stored in (local plant time or UTC)?
+10. Is `TAGLOG.Value` always numeric, or does it also hold text and booleans (for example, alarm states)?
+11. Which of the "few more" TAGS columns are required? Are there keys or types we need to know about?
+12. Is `TAGLOG` append-only, or can readings be corrected or deleted in SCADA? This decides whether the MERGE needs update handling.
+13. What is the `Location` format (free text, or codes that match a spool's location list)?
 
 ## Next Steps
 
