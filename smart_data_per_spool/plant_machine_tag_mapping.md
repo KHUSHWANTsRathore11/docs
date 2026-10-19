@@ -23,6 +23,17 @@ Joins are listed in order.
 
 Machine comes from `Resource_` at step 8. The column that holds the machine name is to be provided.
 
+## Plant-Scoped Join
+
+The Silver tables hold data for all plants, so every join must include the plant. The MES and SCADA plant names differ, so the derived plant mapping is the join key between them.
+
+1. Build the derived plant mapping from the CSV and `MI_CONNECTOR` (see Plant Name Mapping). Result: `(SCADA PlantName, DepartmentName)` → MES `PlantName`.
+2. Join `scada_tags` to the mapping on `(PlantName, DepartmentName)`, giving each SCADA tag its MES plant.
+3. Join to `MI_POINT` on `DbTag` = `OPCpointName` **and** MES `PlantName` = `MI_POINT.PlantName`.
+4. Continue the chain from `MI_POINT` to `Resource_` as above.
+
+Why the plant is part of the join: `TagId` restarts per plant and department, and a `DbTag` value can appear in more than one plant. Matching on the tag name alone could link a tag to the wrong plant's point.
+
 ## Plant Name Mapping
 
 MES `PlantName` and SCADA `PlantName` are **not always the same**. This must be handled in the logic.
