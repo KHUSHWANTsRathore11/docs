@@ -219,7 +219,7 @@ def merge_scd1(
     return {"operation": last["operation"], **(last["operationMetrics"] or {})}
 
 
-SCD2_OPEN_END = datetime(9999, 12, 31)  # ValidTo of the current version (timestamp sentinel)
+SCD2_OPEN_END = datetime(9999, 12, 31)  # EffectiveEndDate of the current version (timestamp sentinel)
 
 
 def scd2_merge(
@@ -231,20 +231,25 @@ def scd2_merge(
     volatile_columns=(),
     load_ts: datetime = None,
     close_missing: bool = True,
-    valid_from: str = "ValidFrom",
-    valid_to: str = "ValidTo",
+    valid_from: str = "EffectiveStartDate",
+    valid_to: str = "EffectiveEndDate",
     is_current: str = "IsCurrent",
+    audit_insert: str = "DWInsertDate",
+    audit_update: str = "DWUpdateDate",
 ) -> dict:
     """SCD Type 2 merge of a full snapshot, with volatile columns updated in place.
 
     * **Tracked** columns: a change creates a new version. The old version is closed
-      (`ValidTo = load_ts`, `IsCurrent = false`) and the new one opened (`ValidFrom = load_ts`,
-      `ValidTo = 9999-12-31`, `IsCurrent = true`).
+      (`EffectiveEndDate = load_ts`, `IsCurrent = false`) and the new one opened
+      (`EffectiveStartDate = load_ts`, `EffectiveEndDate = 9999-12-31`, `IsCurrent = true`).
     * **Volatile** columns: a change overwrites the current version in place, with no new
       version (CLAUDE.md 5.2, alternative 1). Their history is not kept.
     * **Undeclared** non-key columns are tracked (the conservative default).
     * A key present in the target but absent from the snapshot is closed when `close_missing`.
     * Unchanged keys are not touched, so re-running the same snapshot changes nothing.
+    * Audit columns (`audit_insert`, `audit_update`) are maintained by the merge and never
+      compared: `DWInsertDate` is the run time a version was inserted; `DWUpdateDate` is the run time
+      a row was last closed or had a volatile column overwritten (null if never).
 
     Preconditions: `source_df` has one row per key and no null keys; the session time zone is
     UTC (the timestamps are written as session-local). The target, if it exists, must contain
@@ -261,6 +266,9 @@ def scd2_merge(
     tracked = [validate_identifier(c, "tracked column") for c in tracked_columns]
     volatile = [validate_identifier(c, "volatile column") for c in volatile_columns]
     scd_cols = [valid_from, valid_to, is_current]
+    audit_cols = [audit_insert, audit_update]
+    if set(scd_cols + audit_cols) & set(source_df.columns):
+        raise ValueError(f"Source must not contain the SCD or audit columns {scd_cols + audit_cols}")
     attrs = [c for c in source_df.columns if c not in keys]
 
     if set(tracked) & set(volatile):
@@ -268,8 +276,6 @@ def scd2_merge(
     undeclared = [c for c in tracked + volatile if c not in attrs]
     if undeclared:
         raise ValueError(f"Tracked/volatile columns not in the source: {undeclared}")
-    if set(scd_cols) & set(source_df.columns):
-        raise ValueError(f"Source must not contain the validity columns {scd_cols}")
     tracked_all = tracked + [c for c in attrs if c not in tracked and c not in volatile]
 
     if load_ts is None:
@@ -285,15 +291,18 @@ def scd2_merge(
             source_df.withColumn(valid_from, F.lit(load_ts).cast("timestamp"))
                      .withColumn(valid_to, F.lit(SCD2_OPEN_END).cast("timestamp"))
                      .withColumn(is_current, F.lit(True))
+                     .withColumn(audit_insert, F.lit(load_ts).cast("timestamp"))
+                     .withColumn(audit_update, F.lit(None).cast("timestamp"))
         )
         n = initial.count()
         initial.write.format("delta").mode("overwrite").saveAsTable(full_table_name)
         return {"operation": "CREATE", "numTargetRowsInserted": n}
 
     target = spark.table(full_table_name)
-    missing = [c for c in keys + attrs + scd_cols if c not in target.columns]
+    missing = [c for c in keys + attrs + scd_cols + audit_cols if c not in target.columns]
     if missing:
-        raise ValueError(f"{full_table_name} lacks columns {missing}; SCD2 needs them")
+        raise ValueError(f"{full_table_name} lacks columns {missing}; SCD2 needs them "
+                         "(see CLAUDE.md 3.3 for the migration)")
     new_cols = [c for c in attrs if c not in target.columns]
     if new_cols:
         raise ValueError(f"Source has columns not in {full_table_name}: {new_cols}")
@@ -325,13 +334,16 @@ def scd2_merge(
         versions = versions.withColumn(k, F.lit(None).cast(base.schema[k].dataType))
     staged = base.unionByName(versions)
 
-    close_set = {valid_to: F.lit(load_ts).cast("timestamp"), is_current: F.lit(False)}
+    stamp = F.lit(load_ts).cast("timestamp")
+    close_set = {valid_to: stamp, is_current: F.lit(False), audit_update: stamp}
     insert_values = {k: f"source.`__k_{k}`" for k in keys}
     insert_values.update({a: f"source.`{a}`" for a in attrs})
     insert_values.update({
-        valid_from: F.lit(load_ts).cast("timestamp"),
+        valid_from: stamp,
         valid_to: F.lit(SCD2_OPEN_END).cast("timestamp"),
         is_current: F.lit(True),
+        audit_insert: stamp,
+        audit_update: F.lit(None).cast("timestamp"),
     })
     on = " AND ".join(f"target.`{k}` = source.`{k}`" for k in keys) + f" AND target.`{is_current}` = true"
 
@@ -343,7 +355,7 @@ def scd2_merge(
     if volatile:
         merger = merger.whenMatchedUpdate(
             condition="source.`__volatile_changed`",
-            set={a: f"source.`{a}`" for a in volatile},
+            set={**{a: f"source.`{a}`" for a in volatile}, audit_update: stamp},
         )
     merger = merger.whenNotMatchedInsert(values=insert_values)
     if close_missing:

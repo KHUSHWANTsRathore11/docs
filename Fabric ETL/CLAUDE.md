@@ -117,7 +117,7 @@ Fabric ETL/
 
 * **Purpose**: Daily sync of metadata / configuration tables (e.g., `TAGS`), keeping the history of configuration changes. Same merge as Notebook 6 (3.6); the two notebooks use the same rules.
 * **Source**: `p_source_path`, the full path of the daily full snapshot, e.g. `Files/rlayer_SCADA/{Plant}/{Department}/{TableName}.parquet`.
-* **Target**: `p_target_table`, e.g. `silver.TAGS`, in the SCD2 layout (`ValidFrom`, `ValidTo`, `IsCurrent`).
+* **Target**: `p_target_table`, e.g. `silver.TAGS`, in the SCD2 layout (`EffectiveStartDate`, `EffectiveEndDate`, `IsCurrent`).
 * **Implementation**: `nb_lib_delta_helpers.scd2_merge` on `(PlantName, DepartmentName, <p_id_column>)`, with tracked and volatile columns as in 3.6. The previous SCD1 merge (`merge_scd1`) is kept as a comment in the notebook.
 * **Layout**: no partitioning; after the merge runs `OPTIMIZE <p_target_table> ZORDER BY (PlantName, DepartmentName)`.
 * **Parameters**:
@@ -209,13 +209,14 @@ Fabric ETL/
 
 * **Purpose**: keep the history of configuration changes in a metadata table (e.g. `TAGS`) from its daily full snapshot, without the row bloat of hashing the whole row (section 5.1).
 * **Implementation**: `nb_lib_delta_helpers.scd2_merge`, one Delta MERGE on `(PlantName, DepartmentName, <p_id_column>)`:
-  * **Tracked columns** (`p_tracked_columns`, default `PLC_Connection, MESdb_Connection, Unit, EGU, Description, DataType`): a change closes the current version (`ValidTo = run time`, `IsCurrent = false`) and opens a new one (`ValidFrom = run time`, `ValidTo = 9999-12-31`, `IsCurrent = true`).
+  * **Tracked columns** (`p_tracked_columns`, default `PLC_Connection, MESdb_Connection, Unit, EGU, Description, DataType`): a change closes the current version (`EffectiveEndDate = run time`, `IsCurrent = false`) and opens a new one (`EffectiveStartDate = run time`, `EffectiveEndDate = 9999-12-31`, `IsCurrent = true`).
   * **Volatile columns** (`p_volatile_columns`, default `LastValue, LastLog, Quality`): a change overwrites the current version in place; no history is kept for them.
   * **Undeclared source columns** are tracked (the conservative default).
+  * **Audit columns**: `DWInsertDate` = run time the version was inserted; `DWUpdateDate` = run time the row was last closed or had a volatile column overwritten (null if never). They are maintained by the merge, excluded from change detection, and rejected if the source supplies them.
   * **Keys missing from the snapshot** are closed when `p_close_missing` is true (retired tags, section 5.2 alternative 3).
   * Null is compared as a value: a change from null to a value (or back) is a change.
 * **Idempotent**: rerunning the same snapshot changes nothing.
-* **Point-in-time query**: `ValidFrom <= t AND t < ValidTo`; current state: `IsCurrent = true`.
+* **Point-in-time query**: `EffectiveStartDate <= t AND t < EffectiveEndDate`; current state: `IsCurrent = true`.
 * **Preconditions**: one row per key with no null keys (the notebook de-duplicates and drops null keys, reporting the counts); session time zone UTC; the target must contain every source column (no schema evolution for SCD2 — a new source column fails the run).
 * **Parameters**:
   ```python

@@ -18,7 +18,7 @@
 # | | |
 # |---|---|
 # | **Source** | `p_source_path`: full path, e.g. `Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet` (daily full snapshot) |
-# | **Target** | `p_target_table` (SCD Type 2 layout: `ValidFrom`, `ValidTo`, `IsCurrent`) |
+# | **Target** | `p_target_table` (SCD Type 2 layout: `EffectiveStartDate`, `EffectiveEndDate`, `IsCurrent`) |
 # | **Write** | `nb_lib_delta_helpers.scd2_merge` on `(<p_plant_column>, <p_department_column>, <p_id_column>)` |
 # | **Columns** | `p_tracked_columns` create a new version on change; `p_volatile_columns` update in place |
 # | **Optimize** | unpartitioned; `OPTIMIZE <table> ZORDER BY (<p_plant_column>, <p_department_column>)` |

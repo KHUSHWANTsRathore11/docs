@@ -25,8 +25,8 @@
 # | **Columns** | `p_tracked_columns` create a new version on change; `p_volatile_columns` update in place; any other source column is tracked |
 # | **Missing keys** | a key absent from the snapshot is closed (`IsCurrent = false`) when `p_close_missing` is true |
 #
-# Current rows: `IsCurrent = true` and `ValidTo = 9999-12-31`. Query the state at a point in time
-# with `ValidFrom <= t AND t < ValidTo`. Rerunning the same snapshot changes nothing.
+# Current rows: `IsCurrent = true` and `EffectiveEndDate = 9999-12-31`. Query the state at a point in time
+# with `EffectiveStartDate <= t AND t < EffectiveEndDate`. Rerunning the same snapshot changes nothing.
 
 # PARAMETERS CELL ********************
 
