@@ -212,7 +212,8 @@ Fabric ETL/
   * **Tracked columns** (`p_tracked_columns`, default `PLC_Connection, MESdb_Connection, Unit, EGU, Description, DataType`): a change closes the current version (`EffectiveEndDate = run time`, `IsCurrent = false`) and opens a new one (`EffectiveStartDate = run time`, `EffectiveEndDate = 9999-12-31`, `IsCurrent = true`).
   * **Volatile columns** (`p_volatile_columns`, default `LastValue, LastLog, Quality`): a change overwrites the current version in place; no history is kept for them.
   * **Undeclared source columns** are tracked (the conservative default).
-  * **Audit columns**: `DWInsertDate` = run time the version was inserted; `DWUpdateDate` = run time the row was last closed or had a volatile column overwritten (null if never). They are maintained by the merge, excluded from change detection, and rejected if the source supplies them.
+  * **Hash keys** (for joins; section 7.7): `TagKey` = `sha2(PlantName|DepartmentName|TagId)`, stable across versions; `TagVersionKey` = `sha2(PlantName|DepartmentName|TagId|EffectiveStartDate)`, one per version. Both are set on every inserted version. Facts store the version key of the version in effect, so the point-in-time lookup runs once when the fact is loaded.
+* **Audit columns**: `DWInsertDate` = run time the version was inserted; `DWUpdateDate` = run time the row was last closed or had a volatile column overwritten (null if never). They are maintained by the merge, excluded from change detection, and rejected if the source supplies them.
   * **Keys missing from the snapshot** are closed when `p_close_missing` is true (retired tags, section 5.2 alternative 3).
   * Null is compared as a value: a change from null to a value (or back) is a change.
 * **Idempotent**: rerunning the same snapshot changes nothing.
@@ -230,6 +231,7 @@ Fabric ETL/
   p_close_missing     = True
   p_dry_run           = False
   ```
+* **Migration of an existing table** (created before the keys): `nb_lib_delta_helpers.add_scd2_keys(spark, table, keys)` adds `TagKey` / `TagVersionKey` and fills them; it is idempotent. The merge refuses a table without the keys until this has run.
 * **Layout**: unpartitioned; the MERGE needs no Z-Order for the current-version lookup, and `OPTIMIZE ... ZORDER BY (PlantName, DepartmentName)` can be added if the history grows.
 * **Relation to Notebook 3**: both notebooks run the same SCD2 merge (`scd2_merge`) and differ only in target and schedule. Each target table must be written by one of them only, otherwise the two runs interleave their versions.
 
@@ -327,6 +329,10 @@ Column names are matched case-insensitively, as Spark does (`TagId` finds a sour
 ### 7.5 Decisions still pending (section 6)
 * `Date` is written as a `DATE` (`yyyy-MM-dd`); changing it touches only `add_time_columns`.
 * A missing source path fails the run (Spark `PATH_NOT_FOUND`); whether an empty day should be `NO_DATA` instead depends on the Control Layer design.
+
+### 7.7 Hash keys on the SCD2 table
+* `TagKey` and `TagVersionKey` are SHA-256 hex strings computed in SQL by `sha2`, from the same text in the merge, the create path and `add_scd2_keys`. The version key's start time is formatted as `yyyy-MM-dd HH:mm:ss.SSSSSS`, so the same version always hashes the same.
+* Rewriting a version's `EffectiveStartDate` would change its key and break facts that point to it: corrections are made by appending, not by editing dates.
 
 ### 7.6 Telemetry table layout: liquid clustering (decision record)
 **Decision:** telemetry Silver tables use liquid clustering by `(Date, PlantName, DepartmentName, TagId)` with no partitioning, maintained by `OPTIMIZE <table>`. This **requires Fabric Runtime 2.0**: on Runtime 1.3 (Delta 3.2) `OPTIMIZE` on a clustered table rewrites every file of a Z-Cube until it exceeds 100 GB, i.e. the whole table each run; Runtime 2.0 clusters incrementally. Metadata tables (`TAGS`) stay unpartitioned with `ZORDER BY (PlantName, DepartmentName)`.

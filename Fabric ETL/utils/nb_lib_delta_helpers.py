@@ -221,6 +221,25 @@ def merge_scd1(
 
 SCD2_OPEN_END = datetime(9999, 12, 31)  # EffectiveEndDate of the current version (timestamp sentinel)
 
+# Hash keys (CLAUDE.md 3.6). Both are SHA-256 hex strings computed from the same text in every
+# path (merge, create, backfill), so a given version always gets the same key.
+#   TagKey        = sha2(business key)               stable across all versions of a tag
+#   TagVersionKey = sha2(business key | start time)  one per version
+SCD2_START_SQL_FORMAT = "yyyy-MM-dd HH:mm:ss.SSSSSS"   # Spark date_format pattern
+SCD2_START_PY_FORMAT = "%Y-%m-%d %H:%M:%S.%f"          # the same text from Python
+
+
+def _key_sql(key_refs, start_sql=None) -> str:
+    """SQL expression for a hash key over the given column references.
+
+    `start_sql` is a SQL expression giving the version start as text (`'...'` literal or a
+    `date_format(...)` of the start column). Omit it for TagKey.
+    """
+    parts = [f"CAST({ref} AS STRING)" for ref in key_refs]
+    if start_sql is not None:
+        parts.append(start_sql)
+    return f"sha2(concat_ws('|', {', '.join(parts)}), 256)"
+
 
 def scd2_merge(
     spark: SparkSession,
@@ -236,6 +255,8 @@ def scd2_merge(
     is_current: str = "IsCurrent",
     audit_insert: str = "DWInsertDate",
     audit_update: str = "DWUpdateDate",
+    tag_key: str = "TagKey",
+    version_key: str = "TagVersionKey",
 ) -> dict:
     """SCD Type 2 merge of a full snapshot, with volatile columns updated in place.
 
@@ -250,6 +271,9 @@ def scd2_merge(
     * Audit columns (`audit_insert`, `audit_update`) are maintained by the merge and never
       compared: `DWInsertDate` is the run time a version was inserted; `DWUpdateDate` is the run time
       a row was last closed or had a volatile column overwritten (null if never).
+    * Hash keys: `tag_key` (business key) and `version_key` (business key + start time) are set
+      on every inserted version. Existing rows of a table created before them need
+      `add_scd2_keys` once.
 
     Preconditions: `source_df` has one row per key and no null keys; the session time zone is
     UTC (the timestamps are written as session-local). The target, if it exists, must contain
@@ -267,8 +291,9 @@ def scd2_merge(
     volatile = [validate_identifier(c, "volatile column") for c in volatile_columns]
     scd_cols = [valid_from, valid_to, is_current]
     audit_cols = [audit_insert, audit_update]
-    if set(scd_cols + audit_cols) & set(source_df.columns):
-        raise ValueError(f"Source must not contain the SCD or audit columns {scd_cols + audit_cols}")
+    key_cols = [tag_key, version_key]
+    if set(scd_cols + audit_cols + key_cols) & set(source_df.columns):
+        raise ValueError(f"Source must not contain the SCD, audit or key columns {scd_cols + audit_cols + key_cols}")
     attrs = [c for c in source_df.columns if c not in keys]
 
     if set(tracked) & set(volatile):
@@ -287,22 +312,26 @@ def scd2_merge(
         raise ValueError(f"SCD2 source has duplicate keys on {keys}; deduplicate before merging")
 
     if not table_exists(spark, full_table_name):
+        start_text = load_ts.strftime(SCD2_START_PY_FORMAT)
+        key_refs = [f"`{k}`" for k in keys]
         initial = (
             source_df.withColumn(valid_from, F.lit(load_ts).cast("timestamp"))
                      .withColumn(valid_to, F.lit(SCD2_OPEN_END).cast("timestamp"))
                      .withColumn(is_current, F.lit(True))
                      .withColumn(audit_insert, F.lit(load_ts).cast("timestamp"))
                      .withColumn(audit_update, F.lit(None).cast("timestamp"))
+                     .withColumn(tag_key, F.expr(_key_sql(key_refs)))
+                     .withColumn(version_key, F.expr(_key_sql(key_refs, f"'{start_text}'")))
         )
         n = initial.count()
         initial.write.format("delta").mode("overwrite").saveAsTable(full_table_name)
         return {"operation": "CREATE", "numTargetRowsInserted": n}
 
     target = spark.table(full_table_name)
-    missing = [c for c in keys + attrs + scd_cols + audit_cols if c not in target.columns]
+    missing = [c for c in keys + attrs + scd_cols + audit_cols + key_cols if c not in target.columns]
     if missing:
-        raise ValueError(f"{full_table_name} lacks columns {missing}; SCD2 needs them "
-                         "(see CLAUDE.md 3.3 for the migration)")
+        raise ValueError(f"{full_table_name} lacks columns {missing}; SCD2 needs them. Run "
+                         "add_scd2_keys for the hash keys, and see CLAUDE.md 3.3 for the migration.")
     new_cols = [c for c in attrs if c not in target.columns]
     if new_cols:
         raise ValueError(f"Source has columns not in {full_table_name}: {new_cols}")
@@ -336,6 +365,8 @@ def scd2_merge(
 
     stamp = F.lit(load_ts).cast("timestamp")
     close_set = {valid_to: stamp, is_current: F.lit(False), audit_update: stamp}
+    start_text = load_ts.strftime(SCD2_START_PY_FORMAT)
+    key_refs = [f"source.`__k_{k}`" for k in keys]
     insert_values = {k: f"source.`__k_{k}`" for k in keys}
     insert_values.update({a: f"source.`{a}`" for a in attrs})
     insert_values.update({
@@ -344,6 +375,8 @@ def scd2_merge(
         is_current: F.lit(True),
         audit_insert: stamp,
         audit_update: F.lit(None).cast("timestamp"),
+        tag_key: _key_sql(key_refs),
+        version_key: _key_sql(key_refs, f"'{start_text}'"),
     })
     on = " AND ".join(f"target.`{k}` = source.`{k}`" for k in keys) + f" AND target.`{is_current}` = true"
 
@@ -364,6 +397,35 @@ def scd2_merge(
 
     last = DeltaTable.forName(spark, full_table_name).history(1).collect()[0]
     return {"operation": last["operation"], **(last["operationMetrics"] or {})}
+
+
+def add_scd2_keys(
+    spark: SparkSession,
+    full_table_name: str,
+    key_columns,
+    valid_from: str = "EffectiveStartDate",
+    tag_key: str = "TagKey",
+    version_key: str = "TagVersionKey",
+) -> None:
+    """Add `tag_key` and `version_key` to an existing SCD2 table and fill them for every row.
+
+    Idempotent: adds only the missing columns, and fills rows where a key is null. The keys are
+    computed with the same text as `scd2_merge`, so rows written after this get matching keys.
+    """
+    keys = [validate_identifier(c, "key column") for c in key_columns]
+    validate_identifier(valid_from, "valid_from")
+    existing = {c.lower() for c in spark.table(full_table_name).columns}
+    to_add = [c for c in (tag_key, version_key) if c.lower() not in existing]
+    if to_add:
+        spark.sql(f"ALTER TABLE {full_table_name} ADD COLUMNS ({', '.join(f'`{c}` STRING' for c in to_add)})")
+
+    key_refs = [f"`{k}`" for k in keys]
+    start_sql = f"date_format(`{valid_from}`, '{SCD2_START_SQL_FORMAT}')"
+    spark.sql(
+        f"UPDATE {full_table_name} "
+        f"SET `{tag_key}` = {_key_sql(key_refs)}, `{version_key}` = {_key_sql(key_refs, start_sql)} "
+        f"WHERE `{tag_key}` IS NULL OR `{version_key}` IS NULL"
+    )
 
 
 # ---------------------------------------------------------------------------

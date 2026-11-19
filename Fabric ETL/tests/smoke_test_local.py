@@ -269,4 +269,31 @@ try:
     raise SystemExit("audit column in source accepted")
 except ValueError as e: print("rejected:", e)
 
+# hash keys: TagKey = sha256(business key), TagVersionKey = sha256(business key | start time)
+import hashlib
+def sha(text): return hashlib.sha256(text.encode()).hexdigest()
+keyed = spark.table(hist).collect()
+for x in keyed:
+    assert x.TagKey == sha(f"{x.PlantName}|{x.DepartmentName}|{x.TagId}"), x
+    assert x.TagVersionKey == sha(f"{x.PlantName}|{x.DepartmentName}|{x.TagId}|{x.EffectiveStartDate:%Y-%m-%d %H:%M:%S.%f}"), x
+assert len({x.TagVersionKey for x in keyed}) == len(keyed), "version keys not unique"
+assert len({x.TagKey for x in keyed if x.TagId == 1}) == 1, "TagKey changes across versions"
+# keys are set on the rerun-free path too, and never null
+assert spark.table(hist).where("TagKey IS NULL OR TagVersionKey IS NULL").count() == 0
+
+# migration: a table written without keys gets them from add_scd2_keys, matching the merge's values
+mig = "silver.KEY_MIG"
+spark.sql(f"DROP TABLE IF EXISTS {mig}")
+legacy = (spark.table(hist).drop("TagKey", "TagVersionKey"))
+legacy.write.format("delta").mode("overwrite").saveAsTable(mig)
+# the merge refuses a table without keys until it is migrated
+try:
+    h.scd2_merge(spark, snap([("P", "B", 1, "Temp", "K", "x", 1.0, 1)]), mig, ["PlantName", "DepartmentName", "TagId"], TRACK, VOL)
+    raise SystemExit("merge accepted a table without keys")
+except ValueError as e: print("rejected:", str(e)[:120])
+h.add_scd2_keys(spark, mig, ["PlantName", "DepartmentName", "TagId"])
+h.add_scd2_keys(spark, mig, ["PlantName", "DepartmentName", "TagId"])     # idempotent
+for x in spark.table(mig).collect():
+    assert x.TagKey == sha(f"{x.PlantName}|{x.DepartmentName}|{x.TagId}"), x
+    assert x.TagVersionKey == sha(f"{x.PlantName}|{x.DepartmentName}|{x.TagId}|{x.EffectiveStartDate:%Y-%m-%d %H:%M:%S.%f}"), x
 print("ALL OK")
