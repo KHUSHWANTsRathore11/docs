@@ -10,31 +10,35 @@
 
 # MARKDOWN ********************
 
-# # nb_metadata_sync — Daily Metadata Sync, SCD Type 1 (Notebook 3)
+# # nb_metadata_sync — Daily Metadata Sync, SCD Type 2 (Notebook 3)
 #
-# Daily sync of a metadata / configuration table (e.g. `TAGS`) from a full snapshot.
-# Spec: `CLAUDE.md` section 3.3.
+# Daily sync of a metadata / configuration table (e.g. `TAGS`) from a full snapshot, keeping the
+# history of configuration changes. Spec: `CLAUDE.md` sections 3.3 and 3.6.
 #
 # | | |
 # |---|---|
 # | **Source** | `p_source_path`: full path, e.g. `Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet` (daily full snapshot) |
-# | **Target** | `p_target_table` |
-# | **Write** | Delta `MERGE` on `(<p_plant_column>, <p_department_column>, <p_id_column>)`: update matched, insert new |
+# | **Target** | `p_target_table` (SCD Type 2 layout: `ValidFrom`, `ValidTo`, `IsCurrent`) |
+# | **Write** | `nb_lib_delta_helpers.scd2_merge` on `(<p_plant_column>, <p_department_column>, <p_id_column>)` |
+# | **Columns** | `p_tracked_columns` create a new version on change; `p_volatile_columns` update in place |
 # | **Optimize** | unpartitioned; `OPTIMIZE <table> ZORDER BY (<p_plant_column>, <p_department_column>)` |
 #
-# Tags that disappear from the snapshot are left as they are (retirement handling is a future
-# evolution, see `CLAUDE.md` section 5.2).
+# A key absent from the snapshot is closed (`IsCurrent = false`) when `p_close_missing` is true.
+# The previous SCD Type 1 merge is kept as a comment in the merge cell.
 # Relative `Files/...` paths resolve against the default lakehouse; `abfss://...` paths work
 # with any lakehouse attached.
 
 # PARAMETERS CELL ********************
 
-p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
-p_target_table   = "silver.TAGS"
+p_source_path       = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
+p_target_table      = "silver.TAGS"
 p_plant_column      = "PlantName"        # Plant column in the source
 p_department_column = "DepartmentName"   # Department column in the source
-p_id_column      = "TagId"
-p_dry_run        = False
+p_id_column         = "TagId"
+p_tracked_columns   = "PLC_Connection,MESdb_Connection,Unit,EGU,Description,DataType"
+p_volatile_columns  = "LastValue,LastLog,Quality"
+p_close_missing     = True               # close keys that disappear from the snapshot
+p_dry_run           = False
 
 # CELL ********************
 
@@ -54,11 +58,21 @@ plant_column = validate_identifier(p_plant_column, "p_plant_column")
 dept_column  = validate_identifier(p_department_column, "p_department_column")
 id_column    = validate_identifier(p_id_column, "p_id_column")
 dry_run      = to_bool(p_dry_run)
+close_missing = to_bool(p_close_missing)
+
+def column_list(text, name):
+    names = [c.strip() for c in str(text or "").split(",") if c.strip()]
+    return [validate_identifier(c, name) for c in names]
+
+tracked_columns  = column_list(p_tracked_columns, "p_tracked_columns")
+volatile_columns = column_list(p_volatile_columns, "p_volatile_columns")
 
 run_started = datetime.now(timezone.utc)
 print(f"Source : {source_path}")
 print(f"Target : {target_table}")
-print(f"Dry run: {dry_run}")
+print(f"Tracked  : {tracked_columns}")
+print(f"Volatile : {volatile_columns}")
+print(f"Dry run  : {dry_run}")
 
 # CELL ********************
 
@@ -87,7 +101,7 @@ print(f"Rows staged           : {rows_staged}")
 
 # CELL ********************
 
-# MERGE (SCD Type 1)
+# MERGE (SCD Type 2)
 merge_metrics = {}
 if rows_staged == 0:
     status = "NO_DATA"
@@ -96,10 +110,20 @@ elif dry_run:
     staged.show(10, truncate=False)
     status = "DRY_RUN"
 else:
-    merge_metrics = merge_scd1(spark, staged, target_table, key_columns)
+    # SCD Type 2: tracked changes open a new version, volatile changes update in place.
+    merge_metrics = scd2_merge(
+        spark, staged, target_table, key_columns,
+        tracked_columns=tracked_columns,
+        volatile_columns=volatile_columns,
+        load_ts=run_started,
+        close_missing=close_missing,
+    )
     print(f"Merge metrics: {merge_metrics}")
 
-    # Unpartitioned table, Z-Ordered by plant and department (CLAUDE.md 3.3). The MERGE is
+    # SCD Type 1 (previous behaviour), kept for reference:
+    # merge_metrics = merge_scd1(spark, staged, target_table, key_columns)
+
+    # Unpartitioned table, Z-Ordered by plant and department (CLAUDE.md 3.3). The merge is
     # idempotent, so an OPTIMIZE failure can simply fail the run.
     zorder_optimize(spark, target_table, [plant_column, dept_column])
     status = "SUCCEEDED"

@@ -50,7 +50,7 @@ Fabric ETL/
 ├── notebooks/
 │   ├── nb_telemetry_historical.py   <-- [Notebook 1] One-time onboarding load
 │   ├── nb_telemetry_incremental.py  <-- [Notebook 2] Daily scheduled incremental [X-1, X)
-│   ├── nb_metadata_sync.py          <-- [Notebook 3] Daily SCD1 metadata/dimension sync
+│   ├── nb_metadata_sync.py          <-- [Notebook 3] Daily metadata/dimension sync, SCD Type 2
 │   ├── nb_spool_boundaries.py       <-- [Notebook 4] Daily spool boundaries from LASTSpoolPV (Silver -> Silver)
 │   ├── nb_tag_datasource_map.py     <-- [Notebook 5] Tag -> MI point -> group -> data source / connector view
 │   └── nb_metadata_full.py          <-- [Notebook 6] Daily metadata snapshot, SCD Type 2 (tracked + volatile columns)
@@ -113,35 +113,26 @@ Fabric ETL/
 
 ---
 
-### 3.3 Notebook 3: `nb_metadata_sync` (Daily Metadata Sync - SCD Type 1)
+### 3.3 Notebook 3: `nb_metadata_sync` (Daily Metadata Sync - SCD Type 2)
 
-* **Purpose**: Daily sync of metadata / configuration tables (e.g., `TAGS`).
+* **Purpose**: Daily sync of metadata / configuration tables (e.g., `TAGS`), keeping the history of configuration changes. Same merge as Notebook 6 (3.6); the two notebooks use the same rules.
 * **Source**: `p_source_path`, the full path of the daily full snapshot, e.g. `Files/rlayer_SCADA/{Plant}/{Department}/{TableName}.parquet`.
-* **Target**: `p_target_table`, e.g. `silver.TAGS`
-* **Implementation Strategy**: **SCD Type 1 (Delta `MERGE` on Primary Key)**.
-  * Natural/Business Key: `(PlantName, DepartmentName, <p_id_column>)`.
-  * Merge Pattern:
-    ```sql
-    MERGE INTO <p_target_table> AS target
-    USING staged_daily_metadata AS source
-    ON target.PlantName = source.PlantName 
-       AND target.DepartmentName = source.DepartmentName 
-       AND target.<p_id_column> = source.<p_id_column>
-    WHEN MATCHED THEN 
-      UPDATE SET *
-    WHEN NOT MATCHED THEN 
-      INSERT *;
-    ```
+* **Target**: `p_target_table`, e.g. `silver.TAGS`, in the SCD2 layout (`ValidFrom`, `ValidTo`, `IsCurrent`).
+* **Implementation**: `nb_lib_delta_helpers.scd2_merge` on `(PlantName, DepartmentName, <p_id_column>)`, with tracked and volatile columns as in 3.6. The previous SCD1 merge (`merge_scd1`) is kept as a comment in the notebook.
 * **Layout**: no partitioning; after the merge runs `OPTIMIZE <p_target_table> ZORDER BY (PlantName, DepartmentName)`.
 * **Parameters**:
   ```python
-  p_source_path    = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
-  p_target_table   = "silver.TAGS"
+  p_source_path       = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
+  p_target_table      = "silver.TAGS"
   p_plant_column      = "PlantName"
   p_department_column = "DepartmentName"
-  p_id_column      = "TagId"
-  p_dry_run        = False
+  p_id_column         = "TagId"
+  p_tracked_columns   = "PLC_Connection,MESdb_Connection,Unit,EGU,Description,DataType"
+  p_volatile_columns  = "LastValue,LastLog,Quality"
+  p_close_missing     = True
+  p_dry_run           = False
   ```
+* **Migration**: an existing SCD1 `silver.TAGS` has no validity columns, so the first SCD2 run fails with "lacks columns". Recreate the table (drop it and let the run create it, or load the history into `silver.TAGS_HISTORY` first).
 
 ---
 
@@ -239,7 +230,7 @@ Fabric ETL/
   p_dry_run           = False
   ```
 * **Layout**: unpartitioned; the MERGE needs no Z-Order for the current-version lookup, and `OPTIMIZE ... ZORDER BY (PlantName, DepartmentName)` can be added if the history grows.
-* **Relation to Notebook 3**: `nb_metadata_sync` (SCD1) keeps the current values only; `nb_metadata_full` keeps history. Use one or the other for a given table.
+* **Relation to Notebook 3**: both notebooks run the same SCD2 merge (`scd2_merge`) and differ only in target and schedule. Each target table must be written by one of them only, otherwise the two runs interleave their versions.
 
 ---
 

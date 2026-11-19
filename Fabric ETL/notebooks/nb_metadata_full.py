@@ -14,7 +14,8 @@
 #
 # Daily sync of a full metadata snapshot (e.g. `TAGS`) into a Type 2 table: a change in a tracked
 # column closes the current version and opens a new one; volatile columns are overwritten in
-# place. Spec: `CLAUDE.md` section 3.6.
+# place. Spec: `CLAUDE.md` section 3.6. The previous SCD Type 1 merge is kept as a comment in the
+# merge cell.
 #
 # | | |
 # |---|---|
@@ -115,6 +116,10 @@ else:
         close_missing=close_missing,
     )
     print(f"Merge metrics: {merge_metrics}")
+
+    # SCD Type 1 (previous behaviour), kept for reference:
+    # merge_metrics = merge_scd1(spark, staged, target_table, key_columns)
+    # zorder_optimize(spark, target_table, [plant_column, dept_column])
     status = "SUCCEEDED"
 
 staged.unpersist()

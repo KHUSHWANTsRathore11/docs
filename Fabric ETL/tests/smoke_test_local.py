@@ -106,18 +106,21 @@ for v in ["", "a.b.c.d", "silver.TAGS; DROP TABLE x", "silver..TAGS"]:
     try: h.validate_table_name(v); raise SystemExit(f"accepted {v}")
     except ValueError: pass
 
-# metadata
-meta = dict(p_source_path=f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", p_target_table="silver.TAGS")
-r = run("nb_metadata_sync", **meta); print(r); assert r["rows_staged"] == 2
+# metadata: SCD2 on silver.TAGS (tracked Unit/Description, volatile LastValue)
+meta = dict(p_source_path=f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", p_target_table="silver.TAGS",
+            p_tracked_columns="Description,Unit", p_volatile_columns="LastValue")
+r = run("nb_metadata_sync", **meta); print(r); assert r["rows_staged"] == 2 and r["merge_metrics"]["operation"] == "CREATE", r
+# day 2: tag 1 changes unit (tracked), tag 2 disappears, tag 3 is new
 write(f"{bronze}/rlayer_SCADA/PlantA/Boiler/TAGS.parquet", [("PlantA", "Boiler", 1, "Temp", "K", 11.0), ("PlantA", "Boiler", 3, "Flow", "m3", 1.0)], tag_cols)
-r = run("nb_metadata_sync", **meta); print(r)
-spark.table("silver.TAGS").orderBy("TagId").show()
-rows = {x.TagId: x.Unit for x in spark.table("silver.TAGS").collect()}
+r = run("nb_metadata_sync", **meta); print(r); assert r["status"] == "SUCCEEDED", r
+current = {x.TagId: x.Unit for x in spark.table("silver.TAGS").where("IsCurrent").collect()}
+assert current == {1: "K", 3: "m3"}, current
+assert spark.table("silver.TAGS").where("TagId = 1").count() == 2                  # old unit closed, new one open
+assert spark.table("silver.TAGS").where("TagId = 2 AND IsCurrent = false").count() == 1  # missing key closed
 tags_layout = spark.sql("DESCRIBE DETAIL silver.TAGS").select("partitionColumns", "clusteringColumns").collect()[0]
 assert tags_layout[0] == [] and not tags_layout[1], tags_layout
 zo = spark.sql("DESCRIBE HISTORY silver.TAGS").where("operation = 'OPTIMIZE'").select("operationParameters").collect()
 assert zo and "PlantName" in zo[0][0]["zOrderBy"] and "DepartmentName" in zo[0][0]["zOrderBy"], zo
-assert rows == {1: "K", 2: "bar", 3: "m3"}, rows
 for bad in [dict(p_target_table="silver.TAGS; DROP TABLE x"), dict(p_source_path="")]:
     try:
         run("nb_metadata_sync", **{**meta, **bad}); raise SystemExit(f"validation failed for {bad}")
