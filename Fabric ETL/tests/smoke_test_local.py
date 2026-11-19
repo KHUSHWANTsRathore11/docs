@@ -193,4 +193,58 @@ assert spark.sql("SHOW VIEWS IN silver LIKE 'tag_datasource'").count() == 1
 r = run("nb_tag_datasource_map", **mp, p_target="silver.TAG_DATASOURCE_T", p_as_view=False)
 assert spark.table("silver.TAG_DATASOURCE_T").count() == 10, r
 
+# SCD2 merge: tracked change -> new version, volatile change -> in place, missing key -> closed,
+# new key -> inserted, rerun -> no change, null -> value detected as a tracked change
+scd_cols = ["PlantName", "DepartmentName", "TagId", "Description", "Unit", "EGU", "LastValue", "Quality"]
+def snap(rows):
+    return spark.createDataFrame(rows, "PlantName string, DepartmentName string, TagId int, Description string, Unit string, EGU string, LastValue double, Quality int")
+from datetime import datetime as _dt
+t1, t2, t3 = _dt(2026, 11, 1, 2, 0), _dt(2026, 11, 2, 2, 0), _dt(2026, 11, 3, 2, 0)
+hist = "silver.TAGS_HISTORY"
+spark.sql(f"DROP TABLE IF EXISTS {hist}")
+TRACK, VOL = ["Description", "Unit", "EGU"], ["LastValue", "Quality"]
+def scd(df, ts, **kw):
+    return h.scd2_merge(spark, df, hist, ["PlantName", "DepartmentName", "TagId"], TRACK, VOL, load_ts=ts, **kw)
+assert scd(snap([("P", "B", 1, "Temp", "C", "x", 10.0, 1), ("P", "B", 2, "Press", "bar", "x", 5.0, 1), ("P", "B", 3, "Flow", "m3", "x", 1.0, 1)]), t1)["operation"] == "CREATE"
+# day 2: tag 1 unit changes (tracked), tag 2 only LastValue (volatile), tag 3 disappears, tag 4 new
+scd(snap([("P", "B", 1, "Temp", "K", "x", 10.0, 1), ("P", "B", 2, "Press", "bar", "x", 6.0, 0), ("P", "B", 4, "Speed", "rpm", "x", 3.0, 1)]), t2)
+rows = {(r.TagId, str(r.ValidFrom)): r for r in spark.table(hist).collect()}
+cur = {r.TagId: r for r in spark.table(hist).where("IsCurrent").collect()}
+assert spark.table(hist).count() == 5, spark.table(hist).count()          # tag 1: old + new; 2; 3 (closed); 4
+assert sorted(cur) == [1, 2, 4] and cur[1].Unit == "K" and cur[2].LastValue == 6.0 and cur[2].Quality == 0, cur
+assert str(cur[2].ValidFrom) == str(t1) and str(cur[1].ValidFrom) == str(t2), (cur[2], cur[1])   # volatile kept its start
+old1 = spark.table(hist).where("TagId = 1 AND NOT IsCurrent").collect()[0]
+assert old1.Unit == "C" and str(old1.ValidTo) == str(t2), old1
+gone = spark.table(hist).where("TagId = 3").collect()[0]
+assert gone.IsCurrent is False and str(gone.ValidTo) == str(t2), gone
+# rerun the same snapshot: nothing changes
+m = scd(snap([("P", "B", 1, "Temp", "K", "x", 10.0, 1), ("P", "B", 2, "Press", "bar", "x", 6.0, 0), ("P", "B", 4, "Speed", "rpm", "x", 3.0, 1)]), t3)
+assert spark.table(hist).count() == 5, "rerun changed history"
+# day 4: tag 1 Unit goes NULL (null -> value is a change), tag 2 unchanged
+scd(snap([("P", "B", 1, "Temp", None, "x", 10.0, 1), ("P", "B", 2, "Press", "bar", "x", 6.0, 0), ("P", "B", 4, "Speed", "rpm", "x", 3.0, 1)]), _dt(2026, 11, 4))
+assert spark.table(hist).where("TagId = 1 AND IsCurrent").count() == 1 and spark.table(hist).where("TagId = 1").count() == 3
+assert spark.table(hist).where("TagId = 2").count() == 1
+# keys have at most one current version
+assert spark.sql(f"SELECT COUNT(*) FROM (SELECT TagId FROM {hist} WHERE IsCurrent GROUP BY PlantName, DepartmentName, TagId HAVING COUNT(*) > 1)").first()[0] == 0
+# guard rails
+for tracked, volatile in [(["Nope"], VOL), (TRACK, ["Unit"])]:
+    try:
+        h.scd2_merge(spark, snap([("P", "B", 1, "a", "b", "c", 1.0, 1)]), "silver.SCD_TMP",
+                     ["PlantName", "DepartmentName", "TagId"], tracked, volatile)
+        raise SystemExit(f"accepted tracked={tracked} volatile={volatile}")
+    except ValueError as e: print("rejected:", e)
+try:
+    h.scd2_merge(spark, snap([("P", "B", 1, "a", "b", "c", 1.0, 1), ("P", "B", 1, "z", "b", "c", 1.0, 1)]), "silver.SCD_TMP2",
+                 ["PlantName", "DepartmentName", "TagId"], TRACK, VOL); raise SystemExit("duplicate keys accepted")
+except ValueError as e: print("rejected:", e)
+
+# wiring: the notebook end to end, dry run and real run
+spark.createDataFrame([("P", "B", 1, "Temp", "C", "x", 10.0, 1)], "PlantName string, DepartmentName string, TagId int, Description string, Unit string, EGU string, LastValue double, Quality int").write.format("delta").mode("overwrite").saveAsTable("silver.MD_SRC")
+md = dict(p_source_path=f"{bronze}/nb_md_src.parquet", p_target_table="silver.MD_HIST",
+          p_tracked_columns="Description,Unit,EGU", p_volatile_columns="LastValue,Quality")
+write(f"{bronze}/nb_md_src.parquet", [("P", "B", 1, "Temp", "C", "x", 10.0, 1)], scd_cols)
+r = run("nb_metadata_full", **md, p_dry_run=True); assert r["status"] == "DRY_RUN", r
+r = run("nb_metadata_full", **md); assert r["status"] == "SUCCEEDED" and r["merge_metrics"]["operation"] == "CREATE", r
+r = run("nb_metadata_full", **md); assert spark.table("silver.MD_HIST").count() == 1, "notebook rerun changed history"
+
 print("ALL OK")

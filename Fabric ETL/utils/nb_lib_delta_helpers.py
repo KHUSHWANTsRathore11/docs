@@ -25,7 +25,8 @@
 
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from functools import reduce
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -214,6 +215,141 @@ def merge_scd1(
         .whenNotMatchedInsertAll()
         .execute()
     )
+    last = DeltaTable.forName(spark, full_table_name).history(1).collect()[0]
+    return {"operation": last["operation"], **(last["operationMetrics"] or {})}
+
+
+SCD2_OPEN_END = datetime(9999, 12, 31)  # ValidTo of the current version (timestamp sentinel)
+
+
+def scd2_merge(
+    spark: SparkSession,
+    source_df: DataFrame,
+    full_table_name: str,
+    key_columns,
+    tracked_columns,
+    volatile_columns=(),
+    load_ts: datetime = None,
+    close_missing: bool = True,
+    valid_from: str = "ValidFrom",
+    valid_to: str = "ValidTo",
+    is_current: str = "IsCurrent",
+) -> dict:
+    """SCD Type 2 merge of a full snapshot, with volatile columns updated in place.
+
+    * **Tracked** columns: a change creates a new version. The old version is closed
+      (`ValidTo = load_ts`, `IsCurrent = false`) and the new one opened (`ValidFrom = load_ts`,
+      `ValidTo = 9999-12-31`, `IsCurrent = true`).
+    * **Volatile** columns: a change overwrites the current version in place, with no new
+      version (CLAUDE.md 5.2, alternative 1). Their history is not kept.
+    * **Undeclared** non-key columns are tracked (the conservative default).
+    * A key present in the target but absent from the snapshot is closed when `close_missing`.
+    * Unchanged keys are not touched, so re-running the same snapshot changes nothing.
+
+    Preconditions: `source_df` has one row per key and no null keys; the session time zone is
+    UTC (the timestamps are written as session-local). The target, if it exists, must contain
+    every source column plus the three validity columns. Source columns not in the target are
+    an error (no schema evolution for SCD2).
+
+    Implemented as one MERGE. Each changed tracked key appears twice in the MERGE source: once
+    with its key (to close the current version) and once with a null key (which never matches,
+    so it is inserted as the new version). Returns the Delta operation metrics.
+    """
+    from delta.tables import DeltaTable
+
+    keys = require_columns(source_df, key_columns, "SCD2 source")
+    tracked = [validate_identifier(c, "tracked column") for c in tracked_columns]
+    volatile = [validate_identifier(c, "volatile column") for c in volatile_columns]
+    scd_cols = [valid_from, valid_to, is_current]
+    attrs = [c for c in source_df.columns if c not in keys]
+
+    if set(tracked) & set(volatile):
+        raise ValueError(f"Columns listed as both tracked and volatile: {sorted(set(tracked) & set(volatile))}")
+    undeclared = [c for c in tracked + volatile if c not in attrs]
+    if undeclared:
+        raise ValueError(f"Tracked/volatile columns not in the source: {undeclared}")
+    if set(scd_cols) & set(source_df.columns):
+        raise ValueError(f"Source must not contain the validity columns {scd_cols}")
+    tracked_all = tracked + [c for c in attrs if c not in tracked and c not in volatile]
+
+    if load_ts is None:
+        load_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+    elif load_ts.tzinfo is not None:
+        load_ts = load_ts.astimezone(timezone.utc).replace(tzinfo=None)
+
+    if source_df.groupBy(*keys).count().where("count > 1").limit(1).count():
+        raise ValueError(f"SCD2 source has duplicate keys on {keys}; deduplicate before merging")
+
+    if not table_exists(spark, full_table_name):
+        initial = (
+            source_df.withColumn(valid_from, F.lit(load_ts).cast("timestamp"))
+                     .withColumn(valid_to, F.lit(SCD2_OPEN_END).cast("timestamp"))
+                     .withColumn(is_current, F.lit(True))
+        )
+        n = initial.count()
+        initial.write.format("delta").mode("overwrite").saveAsTable(full_table_name)
+        return {"operation": "CREATE", "numTargetRowsInserted": n}
+
+    target = spark.table(full_table_name)
+    missing = [c for c in keys + attrs + scd_cols if c not in target.columns]
+    if missing:
+        raise ValueError(f"{full_table_name} lacks columns {missing}; SCD2 needs them")
+    new_cols = [c for c in attrs if c not in target.columns]
+    if new_cols:
+        raise ValueError(f"Source has columns not in {full_table_name}: {new_cols}")
+
+    # Current version per key, and the source joined to it.
+    current = (
+        target.where(F.col(is_current))
+              .select(*keys, *[F.col(a).alias(f"__t_{a}") for a in attrs])
+              .withColumn("__t_present", F.lit(True))
+    )
+    joined = source_df.join(current, keys, "left")
+    is_new = F.col("__t_present").isNull()
+
+    def changed(cols):
+        if not cols:
+            return F.lit(False)
+        return reduce(lambda a, b: a | b, [~F.col(c).eqNullSafe(F.col(f"__t_{c}")) for c in cols])
+
+    base = (
+        joined
+        .withColumn("__tracked_changed", ~is_new & changed(tracked_all))
+        .withColumn("__volatile_changed", ~is_new & ~changed(tracked_all) & changed(volatile))
+        .drop(*[f"__t_{a}" for a in attrs], "__t_present")
+        .select("*", *[F.col(k).alias(f"__k_{k}") for k in keys])
+    )
+    # Second copy of each tracked change, with null keys: it never matches, so it is inserted.
+    versions = base.where(F.col("__tracked_changed"))
+    for k in keys:
+        versions = versions.withColumn(k, F.lit(None).cast(base.schema[k].dataType))
+    staged = base.unionByName(versions)
+
+    close_set = {valid_to: F.lit(load_ts).cast("timestamp"), is_current: F.lit(False)}
+    insert_values = {k: f"source.`__k_{k}`" for k in keys}
+    insert_values.update({a: f"source.`{a}`" for a in attrs})
+    insert_values.update({
+        valid_from: F.lit(load_ts).cast("timestamp"),
+        valid_to: F.lit(SCD2_OPEN_END).cast("timestamp"),
+        is_current: F.lit(True),
+    })
+    on = " AND ".join(f"target.`{k}` = source.`{k}`" for k in keys) + f" AND target.`{is_current}` = true"
+
+    merger = (
+        DeltaTable.forName(spark, full_table_name).alias("target")
+        .merge(staged.alias("source"), on)
+        .whenMatchedUpdate(condition="source.`__tracked_changed`", set=close_set)
+    )
+    if volatile:
+        merger = merger.whenMatchedUpdate(
+            condition="source.`__volatile_changed`",
+            set={a: f"source.`{a}`" for a in volatile},
+        )
+    merger = merger.whenNotMatchedInsert(values=insert_values)
+    if close_missing:
+        merger = merger.whenNotMatchedBySourceUpdate(condition=f"target.`{is_current}` = true", set=close_set)
+    merger.execute()
+
     last = DeltaTable.forName(spark, full_table_name).history(1).collect()[0]
     return {"operation": last["operation"], **(last["operationMetrics"] or {})}
 

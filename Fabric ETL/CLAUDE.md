@@ -52,7 +52,8 @@ Fabric ETL/
 │   ├── nb_telemetry_incremental.py  <-- [Notebook 2] Daily scheduled incremental [X-1, X)
 │   ├── nb_metadata_sync.py          <-- [Notebook 3] Daily SCD1 metadata/dimension sync
 │   ├── nb_spool_boundaries.py       <-- [Notebook 4] Daily spool boundaries from LASTSpoolPV (Silver -> Silver)
-│   └── nb_tag_datasource_map.py     <-- [Notebook 5] Tag -> MI point -> group -> data source / connector view
+│   ├── nb_tag_datasource_map.py     <-- [Notebook 5] Tag -> MI point -> group -> data source / connector view
+│   └── nb_metadata_full.py          <-- [Notebook 6] Daily metadata snapshot, SCD Type 2 (tracked + volatile columns)
 ├── utils/
 │   └── nb_lib_delta_helpers.py      <-- Shared logic (time columns, clustering, Z-Order, merge)
 └── tests/
@@ -210,6 +211,35 @@ Fabric ETL/
 * **Analysis** (printed, steps 1–6): DBTag coverage and DBTags shared across plants/departments; XML extraction failures and duplicate `OpcPointName`s; unmatched DBTags with case/whitespace near-matches; fan-out tags; missing point groups and data sources; final counts by status and by connector.
 * **Output**: `p_as_view = True` (default) creates a persisted Spark view, visible to Spark only (not to the SQL analytics endpoint or Direct Lake); `False` writes a Delta table with the same query.
 * **Parameters**: table names (`p_tags_table`, `p_point_table`, `p_point_group_table`, `p_data_source_table`, `p_target`), every column name (defaults `DBTag`, `ID`, `PointGroupID`, `Parameter`, `DataSourceID`, `ConnectorID`), `p_xml_element = "OpcPointName"`, `p_as_view`, `p_dry_run` (analysis only).
+
+---
+
+### 3.6 Notebook 6: `nb_metadata_full` (Metadata Snapshot - SCD Type 2)
+
+* **Purpose**: keep the history of configuration changes in a metadata table (e.g. `TAGS`) from its daily full snapshot, without the row bloat of hashing the whole row (section 5.1).
+* **Implementation**: `nb_lib_delta_helpers.scd2_merge`, one Delta MERGE on `(PlantName, DepartmentName, <p_id_column>)`:
+  * **Tracked columns** (`p_tracked_columns`, default `PLC_Connection, MESdb_Connection, Unit, EGU, Description, DataType`): a change closes the current version (`ValidTo = run time`, `IsCurrent = false`) and opens a new one (`ValidFrom = run time`, `ValidTo = 9999-12-31`, `IsCurrent = true`).
+  * **Volatile columns** (`p_volatile_columns`, default `LastValue, LastLog, Quality`): a change overwrites the current version in place; no history is kept for them.
+  * **Undeclared source columns** are tracked (the conservative default).
+  * **Keys missing from the snapshot** are closed when `p_close_missing` is true (retired tags, section 5.2 alternative 3).
+  * Null is compared as a value: a change from null to a value (or back) is a change.
+* **Idempotent**: rerunning the same snapshot changes nothing.
+* **Point-in-time query**: `ValidFrom <= t AND t < ValidTo`; current state: `IsCurrent = true`.
+* **Preconditions**: one row per key with no null keys (the notebook de-duplicates and drops null keys, reporting the counts); session time zone UTC; the target must contain every source column (no schema evolution for SCD2 — a new source column fails the run).
+* **Parameters**:
+  ```python
+  p_source_path       = "Files/rlayer_SCADA/PlantA/Boiler/TAGS.parquet"
+  p_target_table      = "silver.TAGS_HISTORY"
+  p_plant_column      = "PlantName"
+  p_department_column = "DepartmentName"
+  p_id_column         = "TagId"
+  p_tracked_columns   = "PLC_Connection,MESdb_Connection,Unit,EGU,Description,DataType"
+  p_volatile_columns  = "LastValue,LastLog,Quality"
+  p_close_missing     = True
+  p_dry_run           = False
+  ```
+* **Layout**: unpartitioned; the MERGE needs no Z-Order for the current-version lookup, and `OPTIMIZE ... ZORDER BY (PlantName, DepartmentName)` can be added if the history grows.
+* **Relation to Notebook 3**: `nb_metadata_sync` (SCD1) keeps the current values only; `nb_metadata_full` keeps history. Use one or the other for a given table.
 
 ---
 
